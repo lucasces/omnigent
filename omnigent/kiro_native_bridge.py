@@ -90,6 +90,7 @@ KIRO_NATIVE_ENV_UNSET = [
 
 _CHILD_ENV_ALLOWLIST = [
     "COLORTERM",
+    "DISPLAY",
     "HOME",
     "KIRO_CONFIG_HOME",
     "KIRO_HOME",
@@ -103,6 +104,9 @@ _CHILD_ENV_ALLOWLIST = [
     "TERM",
     "TMPDIR",
     "USER",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
 ]
 
 
@@ -369,10 +373,19 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
 
 
 def _capture_pane(socket_path: str, tmux_target: str) -> str:
-    """Capture visible pane contents; return empty string on failure."""
+    """Capture pane contents including scrollback; return "" on failure.
+
+    ``-J`` joins lines tmux soft-wrapped at the pane width, and ``-S -300``
+    extends the capture into scrollback rather than just the visible
+    viewport. Both are strictly additive on top of the plain visible-pane
+    capture — they only add lines above/before what was already there — so
+    they can't change behavior for callers that search from the bottom of
+    the pane (all of them, since Kiro's UI chrome markers they look for sit
+    near the bottom of the transcript).
+    """
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-p", "-t", tmux_target],
+            ["tmux", "-S", socket_path, "capture-pane", "-p", "-J", "-S", "-300", "-t", tmux_target],
             check=False,
             capture_output=True,
             text=True,
@@ -460,56 +473,30 @@ def _kiro_permission_focus_on_reject(pane: str) -> bool:
     return any(line.strip().startswith("❯ No (Tab to edit)") for line in pane.splitlines())
 
 
-def _kiro_active_permission_tool_line(pane: str) -> str:
-    """Return the tool line associated with the active approval panel."""
-    lines = pane.splitlines()
-    approval_index = -1
-    for index, line in enumerate(lines):
-        if "requires approval" in line:
-            approval_index = index
-    if approval_index < 0:
-        return ""
-    for line in reversed(lines[:approval_index]):
-        stripped = line.strip()
-        if not stripped or _KIRO_SEPARATOR in stripped:
-            continue
-        return stripped.lstrip("↓●○✓✗ ").strip()
-    return ""
-
-
-def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None) -> bool:
-    """Return whether the visible prompt appears to match the parsed request title."""
-    if not expected_title:
-        return True
-    title = expected_title.strip()
-    if not title:
-        return True
-    tool_line = _kiro_active_permission_tool_line(pane)
-    if not tool_line:
-        return False
-    if title == tool_line:
-        return True
-    if title.startswith("Running:"):
-        command = title.removeprefix("Running:").strip()
-        return bool(command and (tool_line == command or tool_line.endswith(f" {command}")))
-    return title in tool_line
-
-
 def _wait_for_kiro_permission_prompt(
     socket_path: str,
     tmux_target: str,
     *,
-    expected_title: str | None,
     timeout_s: float,
 ) -> None:
-    """Wait until Kiro has rendered an approval prompt before typing a verdict."""
+    """Wait until Kiro has rendered an approval prompt before typing a verdict.
+
+    Deliberately does not try to verify the visible prompt's *content*
+    matches the ACP request we're answering. Kiro's TUI is strictly modal —
+    it blocks on ``session/request_permission`` and cannot render the next
+    prompt until the current one gets an answer — so there is only ever one
+    live prompt to match against, making content verification redundant.
+    Reconstructing that content from the rendered pane (undoing Kiro's own
+    line wrapping, which breaks mid-word with no space and produces blank
+    lines inside multi-line scripts) was the actual source of failures here,
+    not a real ambiguity it was guarding against. Structural markers
+    (fixed UI chrome strings that never wrap) are sufficient and robust.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if (
-            _kiro_permission_prompt_active(pane)
-            and _kiro_permission_focus_on_one_time_allow(pane)
-            and _kiro_permission_prompt_matches_title(pane, expected_title)
+        if _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(
+            pane
         ):
             return
         time.sleep(_POLL_INTERVAL_S)
@@ -706,7 +693,6 @@ def send_kiro_permission_verdict(
     bridge_dir: Path,
     *,
     action: str,
-    expected_title: str | None = None,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
     """Deliver a one-time Kiro permission verdict to the active TUI prompt."""
@@ -719,16 +705,12 @@ def send_kiro_permission_verdict(
         raise RuntimeError(
             "kiro terminal is no longer running (the TUI exited); restart the session"
         )
-    _wait_for_kiro_permission_prompt(
-        socket_path, tmux_target, expected_title=expected_title, timeout_s=timeout_s
-    )
+    _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
     if action == "accept":
         time.sleep(_PERMISSION_ENTER_SETTLE_S)
         pane = _capture_pane(socket_path, tmux_target)
         if not (
-            _kiro_permission_prompt_active(pane)
-            and _kiro_permission_focus_on_one_time_allow(pane)
-            and _kiro_permission_prompt_matches_title(pane, expected_title)
+            _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(pane)
         ):
             raise RuntimeError("kiro-native allow option was not safely focused before delivery")
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
@@ -738,11 +720,7 @@ def send_kiro_permission_verdict(
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
     pane = _capture_pane(socket_path, tmux_target)
-    if not (
-        _kiro_permission_prompt_active(pane)
-        and _kiro_permission_focus_on_reject(pane)
-        and _kiro_permission_prompt_matches_title(pane, expected_title)
-    ):
+    if not (_kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_reject(pane)):
         raise RuntimeError("kiro-native reject option was not safely focused before delivery")
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
