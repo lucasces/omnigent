@@ -21,6 +21,15 @@ _POST_TIMEOUT_S = 86400.0
 _PREVIEW_MAX = 1024
 _SUPPORTED_ACCEPT_OPTION = "allow_once"
 _SUPPORTED_DECLINE_OPTION = "reject_once"
+# Retry budget for the initial hook POST that parks an approval on the
+# server. A transient blip there (observed: a single 502 from the proxy in
+# front of the server, pod logs otherwise clean) previously meant the
+# elicitation card never got created — Kiro's TUI sat on "thinking" with no
+# visible difference from normal work, so a stuck session looked identical
+# to a working one. Three attempts with short backoff absorb that class of
+# blip silently; only a failure that survives all three is treated as real.
+_HOOK_POST_MAX_ATTEMPTS = 3
+_HOOK_POST_RETRY_DELAYS_S = (1.0, 3.0)
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,50 @@ class _PendingPermission:
 
     elicitation_id: str
     task: asyncio.Task[None]
+
+
+class _DeliveryCoordinator:
+    """Serializes and orders keystroke delivery to Kiro's single-prompt TUI.
+
+    Kiro can emit many ``session/request_permission`` calls up front (e.g. a
+    batch of file edits) but its TUI is strictly modal: only one approval
+    prompt is ever visible, always the oldest unanswered one, and Kiro only
+    advances once that exact prompt is answered. If concurrent tasks each
+    independently polled "is *a* prompt showing and focused on allow" and
+    fired Enter, whichever task saw that state first would answer whatever
+    prompt happened to be visible — not necessarily its own request. With a
+    high volume of concurrent requests this caused tasks to race, some
+    requests to never even get parked with the web UI, and the whole batch
+    to wedge.
+
+    This coordinator keeps a FIFO queue in the exact order
+    ``request_permission`` events were parsed (which matches the order Kiro
+    presents them, since Kiro only ever shows the oldest unanswered one) and
+    only lets a task touch the tmux pane once it is at the front of that
+    queue. A slot is only popped once Kiro's own ACP log confirms — via a
+    ``response`` event — that the request was actually resolved, not merely
+    when our keystroke-send call returns; that is the only signal that
+    reliably means "the visible prompt moved on."
+    """
+
+    def __init__(self) -> None:
+        self._order: list[str] = []
+        self._condition = asyncio.Condition()
+
+    def register(self, request_id: str) -> None:
+        self._order.append(request_id)
+
+    async def wait_turn(self, request_id: str) -> None:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: bool(self._order) and self._order[0] == request_id
+            )
+
+    async def complete(self, request_id: str) -> None:
+        async with self._condition:
+            with contextlib.suppress(ValueError):
+                self._order.remove(request_id)
+            self._condition.notify_all()
 
 
 def kiro_permission_elicitation_id(session_id: str, request_id: str) -> str:
@@ -202,7 +255,7 @@ async def supervise_kiro_permission_mirror(
     except OSError:
         offset = 0
     pending: dict[str, _PendingPermission] = {}
-    queued: dict[str, KiroPermissionRequest] = {}
+    coordinator = _DeliveryCoordinator()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
@@ -213,10 +266,11 @@ async def supervise_kiro_permission_mirror(
                     _read_new_permission_events, record_file, offset
                 )
                 # Reap finished delivery tasks so a completed or failed web verdict
-                # frees the single-prompt slot. Without this, a keystroke-delivery
+                # frees that request's slot. Without this, a keystroke-delivery
                 # failure would leave the slot occupied forever and silently block
-                # every later prompt from the web mirror. A late matching response
-                # event then finds no pending entry and is safely ignored.
+                # a later response event for the same request from finding its
+                # entry. A late matching response event then finds no pending
+                # entry and is safely ignored.
                 for done_id in [rid for rid, entry in pending.items() if entry.task.done()]:
                     pending.pop(done_id, None)
                 resolved_in_batch = {
@@ -224,16 +278,41 @@ async def supervise_kiro_permission_mirror(
                 }
                 for event in events:
                     if event.kind == "request":
+                        # Kiro can emit more than one session/request_permission
+                        # before the first is answered (e.g. a batch of tool
+                        # calls). Track each request_id independently instead of
+                        # gating on "any pending" — the previous single-slot
+                        # check silently dropped every request after the first,
+                        # leaving Kiro's TUI blocked on a prompt the web mirror
+                        # never surfaced.
                         if (
                             event.permission is None
                             or event.request_id in resolved_in_batch
                             or event.request_id in pending
-                            or event.request_id in queued
                         ):
                             continue
-                        queued[event.request_id] = event.permission
+                        elicitation_id = kiro_permission_elicitation_id(
+                            session_id, event.request_id
+                        )
+                        coordinator.register(event.request_id)
+                        task = asyncio.create_task(
+                            _run_one_permission(
+                                client,
+                                session_id=session_id,
+                                bridge_dir=bridge_dir,
+                                permission=event.permission,
+                                elicitation_id=elicitation_id,
+                                coordinator=coordinator,
+                            ),
+                            name=f"kiro-permission-{event.request_id}",
+                        )
+                        task.add_done_callback(_consume_task_result)
+                        pending[event.request_id] = _PendingPermission(elicitation_id, task)
                     else:
-                        queued.pop(event.request_id, None)
+                        # Kiro's ACP response is the only reliable signal that the
+                        # visible prompt actually moved on (our own keystroke-send
+                        # call returning isn't enough — see _DeliveryCoordinator).
+                        await coordinator.complete(event.request_id)
                         entry = pending.pop(event.request_id, None)
                         if entry is None:
                             continue
@@ -242,22 +321,6 @@ async def supervise_kiro_permission_mirror(
                                 client, session_id, entry.elicitation_id
                             )
                             entry.task.cancel()
-                if not pending and queued:
-                    request_id = next(iter(queued))
-                    permission = queued.pop(request_id)
-                    elicitation_id = kiro_permission_elicitation_id(session_id, request_id)
-                    task = asyncio.create_task(
-                        _run_one_permission(
-                            client,
-                            session_id=session_id,
-                            bridge_dir=bridge_dir,
-                            permission=permission,
-                            elicitation_id=elicitation_id,
-                        ),
-                        name=f"kiro-permission-{request_id}",
-                    )
-                    task.add_done_callback(_consume_task_result)
-                    pending[request_id] = _PendingPermission(elicitation_id, task)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -276,54 +339,189 @@ async def _run_one_permission(
     bridge_dir: Path,
     permission: KiroPermissionRequest,
     elicitation_id: str,
+    coordinator: _DeliveryCoordinator,
 ) -> None:
-    """Park one Kiro permission request on the server and deliver the verdict."""
-    payload = {
-        "elicitation_id": elicitation_id,
-        "agent": "Kiro",
-        "policy_name": "kiro_native_permission",
-        "operation_type": "tool",
-        "message": f"Kiro wants approval for {permission.preview}",
-        "content_preview": permission.preview,
-    }
+    """Park one Kiro permission request on the server and deliver the verdict.
+
+    Every exit path — early return on a hook-POST error, or the delivery
+    attempt itself failing/succeeding — must free this request's coordinator
+    slot exactly once. The normal completion signal is the ACP "response"
+    event handled in the main poll loop, but that event only fires once
+    Kiro's prompt is actually answered; any early return here (POST failed,
+    non-2xx, non-JSON body, no usable action) leaves that prompt never
+    reached, so nothing will ever generate that event for this request.
+    Wrapping the whole body in try/finally guarantees the coordinator's
+    queue always advances, instead of deadlocking every later request behind
+    a slot nothing will ever release (observed in production: one dropped
+    hook response was enough to silently stall every subsequent approval).
+    """
+    try:
+        payload = {
+            "elicitation_id": elicitation_id,
+            "agent": "Kiro",
+            "policy_name": "kiro_native_permission",
+            "operation_type": "tool",
+            "message": f"Kiro wants approval for {permission.preview}",
+            "content_preview": permission.preview,
+        }
+        response = await _post_hook_with_retry(
+            client, session_id=session_id, payload=payload
+        )
+        if response is None:
+            # Retries exhausted — the elicitation card was never created, so
+            # Kiro's TUI is now waiting on a decision the web UI never got a
+            # chance to surface. Without this notice the turn just looks like
+            # it is still thinking; say so explicitly instead.
+            await _post_external_assistant_notice(
+                client,
+                session_id=session_id,
+                text=(
+                    "⚠️ Kiro está esperando aprovação para "
+                    f"`{permission.preview}`, mas o Omnigent não conseguiu registrar "
+                    "essa aprovação no servidor após 3 tentativas. A sessão pode "
+                    "estar parada esperando uma decisão manual no terminal."
+                ),
+            )
+            return
+        if response.status_code >= 400:
+            _logger.warning(
+                "kiro permission hook rejected: status=%s body=%s",
+                response.status_code,
+                response.text[:512],
+            )
+            await _post_external_assistant_notice(
+                client,
+                session_id=session_id,
+                text=(
+                    "⚠️ Kiro está esperando aprovação para "
+                    f"`{permission.preview}`, mas o servidor rejeitou o pedido "
+                    f"(HTTP {response.status_code}). A sessão pode estar parada "
+                    "esperando uma decisão manual no terminal."
+                ),
+            )
+            return
+        if not response.content:
+            return
+        try:
+            result = response.json()
+        except ValueError:
+            _logger.warning("kiro permission hook returned non-JSON: %s", response.text[:512])
+            return
+        action = result.get("action") if isinstance(result, dict) else None
+        if action not in {"accept", "decline", "cancel"}:
+            return
+        # Wait until this is the oldest still-unanswered request before
+        # touching the shared tmux pane — Kiro only ever shows one prompt at
+        # a time, and it's always this one's turn only once every older
+        # request has been confirmed resolved (see _DeliveryCoordinator).
+        await coordinator.wait_turn(permission.request_id)
+        try:
+            await asyncio.to_thread(
+                send_kiro_permission_verdict,
+                bridge_dir,
+                action=action,
+            )
+        except RuntimeError:
+            _logger.exception(
+                "failed to deliver kiro permission verdict for %s; session=%s",
+                permission.request_id,
+                session_id,
+            )
+            # The web UI already showed the approval and recorded a verdict —
+            # from the user's side this looked handled. Say plainly that the
+            # keystroke never reached the TUI, so "approved but nothing
+            # happened" doesn't read as ongoing processing.
+            await _post_external_assistant_notice(
+                client,
+                session_id=session_id,
+                text=(
+                    "⚠️ A aprovação para "
+                    f"`{permission.preview}` foi registrada, mas o Omnigent não "
+                    "conseguiu confirmar que o Kiro recebeu a decisão no terminal. "
+                    "Verifique a sessão — pode ser necessário aprovar manualmente."
+                ),
+            )
+    finally:
+        await coordinator.complete(permission.request_id)
+
+
+async def _post_hook_with_retry(
+    client: httpx.AsyncClient, *, session_id: str, payload: dict[str, str]
+) -> httpx.Response | None:
+    """POST the native-permission-request hook, retrying transient failures.
+
+    Retries a connection error or 5xx response (proxy/server hiccups, like
+    the single 502 that motivated this) up to :data:`_HOOK_POST_MAX_ATTEMPTS`
+    times with short backoff. A 4xx is not retried — that is a request the
+    server actively rejected, not a blip, and won't succeed on replay.
+    Returns ``None`` only once every attempt has failed to produce a usable
+    response, so the caller can tell "never even asked the server" apart
+    from "server answered but declined."
+    """
+    last_response: httpx.Response | None = None
+    for attempt in range(_HOOK_POST_MAX_ATTEMPTS):
+        try:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/hooks/native-permission-request",
+                json=payload,
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "kiro permission hook POST failed (attempt %d/%d); session=%s",
+                attempt + 1,
+                _HOOK_POST_MAX_ATTEMPTS,
+                session_id,
+                exc_info=True,
+            )
+        else:
+            if response.status_code < 500:
+                return response
+            last_response = response
+            _logger.warning(
+                "kiro permission hook returned %s (attempt %d/%d); session=%s",
+                response.status_code,
+                attempt + 1,
+                _HOOK_POST_MAX_ATTEMPTS,
+                session_id,
+            )
+        if attempt < len(_HOOK_POST_RETRY_DELAYS_S):
+            await asyncio.sleep(_HOOK_POST_RETRY_DELAYS_S[attempt])
+    return last_response
+
+
+async def _post_external_assistant_notice(
+    client: httpx.AsyncClient, *, session_id: str, text: str
+) -> None:
+    """Post a visible system notice into the conversation timeline.
+
+    Uses the ``external_assistant_message`` event type, which persists and
+    broadcasts append-only conversation history without touching Omnigent's
+    task/turn state (server-side: ``_persist_external_assistant_message`` —
+    "bypasses the legacy persist path so mirroring a terminal response does
+    not create or steer an Omnigent agent task"). That property matters here:
+    a failed hook POST or verdict delivery happens outside any turn Omnigent
+    is tracking, so this must not look like the agent said something or be
+    mistaken for a real turn completing — it is purely an out-of-band notice
+    so a stalled approval reads as "something failed," not as ordinary
+    "still thinking" silence.
+    """
     try:
         response = await client.post(
-            f"/v1/sessions/{session_id}/hooks/native-permission-request",
-            json=payload,
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_assistant_message",
+                "data": {"agent": "Kiro", "text": text},
+            },
+            timeout=10.0,
         )
+        if response.status_code >= 400:
+            _logger.warning(
+                "kiro external_assistant_message rejected: status=%s body=%s",
+                response.status_code,
+                response.text[:512],
+            )
     except httpx.HTTPError:
-        _logger.exception("kiro permission hook POST failed; session=%s", session_id)
-        return
-    if response.status_code >= 400:
-        _logger.warning(
-            "kiro permission hook rejected: status=%s body=%s",
-            response.status_code,
-            response.text[:512],
-        )
-        return
-    if not response.content:
-        return
-    try:
-        result = response.json()
-    except ValueError:
-        _logger.warning("kiro permission hook returned non-JSON: %s", response.text[:512])
-        return
-    action = result.get("action") if isinstance(result, dict) else None
-    if action not in {"accept", "decline", "cancel"}:
-        return
-    try:
-        await asyncio.to_thread(
-            send_kiro_permission_verdict,
-            bridge_dir,
-            action=action,
-            expected_title=permission.title,
-        )
-    except RuntimeError:
-        _logger.exception(
-            "failed to deliver kiro permission verdict for %s; session=%s",
-            permission.request_id,
-            session_id,
-        )
+        _logger.exception("kiro external_assistant_message POST failed")
 
 
 async def _post_external_elicitation_resolved(
