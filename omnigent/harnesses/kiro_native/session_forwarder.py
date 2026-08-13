@@ -2,8 +2,15 @@
 
 Kiro CLI persists chat turns under ``~/.kiro/sessions/cli`` as session metadata
 plus JSONL message records. The native Kiro terminal path injects web prompts
-into the TUI; this forwarder mirrors Kiro's persisted assistant messages back
-into the Omnigent conversation with ``external_conversation_item`` events.
+into the TUI; this forwarder mirrors Kiro's persisted assistant messages —
+plus any ``toolUse``/``toolResult`` blocks they carry — back into the
+Omnigent conversation with ``external_conversation_item`` events (as
+``message``, ``function_call``, and ``function_call_output`` items
+respectively — the same item types ``claude_native_bridge.py`` uses for
+Claude Code). Without the tool-call/result mirroring, a Kiro command's only
+trace in the web UI was the fleeting approval-dialog preview: gone for good
+once the elicitation resolved and the conversation reloaded, and never
+surfaced its own tool-card spinner while running.
 """
 
 from __future__ import annotations
@@ -52,6 +59,33 @@ class KiroConversationMessage:
 
 
 _KiroConversationMessage = KiroConversationMessage
+
+
+@dataclass(frozen=True)
+class KiroToolCall:
+    """One ``toolUse`` block pulled out of a Kiro ``AssistantMessage`` record.
+
+    Forwarded as a ``function_call`` item so the command gets a durable,
+    reload-surviving record and its own tool-card spinner in the UI, instead
+    of being visible only in the transient approval-dialog preview.
+    """
+
+    message_id: str
+    call_id: str
+    name: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True)
+class KiroToolResult:
+    """One ``toolResult`` block pulled out of a Kiro ``ToolResults`` record."""
+
+    message_id: str
+    call_id: str
+    output: str
+
+
+KiroForwardItem = KiroConversationMessage | KiroToolCall | KiroToolResult
 
 
 def kiro_cli_sessions_dir(home: Path | None = None) -> Path:
@@ -221,9 +255,16 @@ def _kiro_session_jsonl_for_id(
 def _read_new_kiro_messages(
     jsonl_path: Path,
     byte_offset: int,
-) -> tuple[list[KiroConversationMessage], int]:
-    """Read conversation messages after *byte_offset* from Kiro's JSONL file."""
-    messages: list[KiroConversationMessage] = []
+) -> tuple[list[KiroForwardItem], int]:
+    """Read forwardable items after *byte_offset* from Kiro's JSONL file.
+
+    Items are messages, tool calls, and tool results (see
+    :func:`_parse_kiro_jsonl_line_items`) — despite the name, this has
+    covered more than plain conversation messages since tool-call mirroring
+    was added; kept for the stable call sites/tests that already reference
+    it.
+    """
+    items: list[KiroForwardItem] = []
     try:
         with jsonl_path.open("rb") as handle:
             handle.seek(byte_offset)
@@ -241,10 +282,8 @@ def _read_new_kiro_messages(
                     line = raw_line.decode("utf-8")
                 except UnicodeDecodeError:
                     continue
-                message = parse_kiro_jsonl_line(line)
-                if message is not None:
-                    messages.append(message)
-            return messages, offset
+                items.extend(_parse_kiro_jsonl_line_items(line))
+            return items, offset
     except OSError:
         return [], byte_offset
 
@@ -296,6 +335,95 @@ def _kiro_content_text(content: object) -> str:
     return "\n".join(parts)
 
 
+def _parse_kiro_jsonl_line_items(line: str) -> list[KiroForwardItem]:
+    """Parse one Kiro JSONL line into every forwardable item it carries.
+
+    Unlike :func:`parse_kiro_jsonl_line` (text-only, the stable contract
+    shared with offline import), this also surfaces ``toolUse``/
+    ``toolResult`` blocks so the live forwarder can mirror them as durable
+    ``function_call``/``function_call_output`` items. A single
+    ``AssistantMessage`` record commonly carries both narration text and one
+    or more ``toolUse`` blocks in the same turn, so this returns a list.
+    """
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(record, dict):
+        return []
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return []
+    message_id = data.get("message_id")
+    if not isinstance(message_id, str) or not message_id:
+        return []
+    kind = record.get("kind")
+    if kind == "Prompt":
+        text = _kiro_content_text(data.get("content")).strip()
+        if not text:
+            return []
+        return [KiroConversationMessage(message_id=message_id, role="user", text=text)]
+    if kind == "AssistantMessage":
+        return _kiro_assistant_message_items(message_id, data.get("content"))
+    if kind == "ToolResults":
+        return _kiro_tool_result_items(message_id, data.get("content"))
+    return []
+
+
+def _kiro_assistant_message_items(message_id: str, content: object) -> list[KiroForwardItem]:
+    """Split one AssistantMessage's content blocks into text + toolUse items."""
+    if not isinstance(content, list):
+        return []
+    items: list[KiroForwardItem] = []
+    text = _kiro_content_text(content).strip()
+    if text:
+        items.append(KiroConversationMessage(message_id=message_id, role="assistant", text=text))
+    for block in content:
+        if not isinstance(block, dict) or block.get("kind") != "toolUse":
+            continue
+        tool_data = block.get("data")
+        if not isinstance(tool_data, dict):
+            continue
+        call_id = tool_data.get("toolUseId")
+        name = tool_data.get("name")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        if not isinstance(name, str) or not name:
+            continue
+        arguments = tool_data.get("input")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        items.append(
+            KiroToolCall(message_id=message_id, call_id=call_id, name=name, arguments=arguments)
+        )
+    return items
+
+
+def _kiro_tool_result_items(message_id: str, content: object) -> list[KiroForwardItem]:
+    """Extract toolResult blocks from one ToolResults record.
+
+    Non-text results (e.g. an image tool result) forward with an empty
+    ``output`` — there is no text to mirror, but the call still gets its
+    durable, matched-by-``call_id`` output item instead of being left to
+    look forever "still running" in the UI.
+    """
+    if not isinstance(content, list):
+        return []
+    items: list[KiroForwardItem] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("kind") != "toolResult":
+            continue
+        result_data = block.get("data")
+        if not isinstance(result_data, dict):
+            continue
+        call_id = result_data.get("toolUseId")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        output = _kiro_content_text(result_data.get("content")).strip()
+        items.append(KiroToolResult(message_id=message_id, call_id=call_id, output=output))
+    return items
+
+
 async def _post_conversation_message(
     client: httpx.AsyncClient,
     *,
@@ -323,6 +451,62 @@ async def _post_conversation_message(
                 "item_type": "message",
                 "item_data": item_data,
                 "response_id": f"kiro:{message.message_id}",
+            },
+        },
+    )
+    resp.raise_for_status()
+
+
+async def _post_kiro_tool_call(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    agent_name: str,
+    call: KiroToolCall,
+) -> None:
+    """POST one Kiro tool invocation as a persisted ``function_call`` item.
+
+    Same item type/shape ``claude_native_bridge.py`` posts for Claude Code's
+    ``tool_use`` blocks — the web UI's tool-card rendering and call/result
+    matching by ``call_id`` already handle it generically.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": agent_name,
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":")),
+                    "call_id": call.call_id,
+                },
+                "response_id": f"kiro:{call.message_id}",
+            },
+        },
+    )
+    resp.raise_for_status()
+
+
+async def _post_kiro_tool_result(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    result: KiroToolResult,
+) -> None:
+    """POST one Kiro tool result as a persisted ``function_call_output`` item."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {
+                    "call_id": result.call_id,
+                    "output": result.output,
+                },
+                "response_id": f"kiro:{result.message_id}",
             },
         },
     )
@@ -551,12 +735,12 @@ async def forward_kiro_session_to_omnigent(
                             external_session_id=state.session_id,
                         )
                         mirrored_external_session_id = state.session_id
-                    messages, byte_offset = await asyncio.to_thread(
+                    items, byte_offset = await asyncio.to_thread(
                         _read_new_kiro_messages,
                         jsonl_path,
                         state.byte_offset,
                     )
-                    for message in messages:
+                    for item in items:
                         # Mirror the transcript only. Running/idle status for
                         # kiro-native is owned by the PTY watcher's ``emit_status``
                         # (``runner/resource_registry.py``), matching the other
@@ -564,12 +748,26 @@ async def forward_kiro_session_to_omnigent(
                         # whose forwarders mirror the transcript, not the
                         # running/idle session status. Posting status here too
                         # double-sourced it (#1137).
-                        await _post_conversation_message(
-                            client,
-                            session_id=session_id,
-                            agent_name=agent_name,
-                            message=message,
-                        )
+                        if isinstance(item, KiroConversationMessage):
+                            await _post_conversation_message(
+                                client,
+                                session_id=session_id,
+                                agent_name=agent_name,
+                                message=item,
+                            )
+                        elif isinstance(item, KiroToolCall):
+                            await _post_kiro_tool_call(
+                                client,
+                                session_id=session_id,
+                                agent_name=agent_name,
+                                call=item,
+                            )
+                        else:
+                            await _post_kiro_tool_result(
+                                client,
+                                session_id=session_id,
+                                result=item,
+                            )
                     if byte_offset != state.byte_offset:
                         state.byte_offset = byte_offset
                         _write_state(bridge_dir, state)

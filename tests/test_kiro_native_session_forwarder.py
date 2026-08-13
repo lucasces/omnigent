@@ -265,6 +265,295 @@ def test_read_new_kiro_messages_holds_offset_at_partial_trailing_line(tmp_path: 
     assert offset == jsonl_path.stat().st_size
 
 
+def test_read_new_kiro_messages_extracts_tool_use_blocks(tmp_path: Path) -> None:
+    """toolUse blocks inside an AssistantMessage forward as KiroToolCall items.
+
+    Shape matches a real Kiro CLI session record: a ``text`` block (often
+    empty) followed by one or more ``toolUse`` blocks in the same turn.
+    Previously these were silently dropped — only the (often empty) text
+    was ever forwarded.
+    """
+    jsonl_path = tmp_path / "session.jsonl"
+    jsonl_path.write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "assistant-1",
+                    "content": [
+                        {"kind": "text", "data": ""},
+                        {
+                            "kind": "toolUse",
+                            "data": {
+                                "toolUseId": "tooluse_abc123",
+                                "name": "execute_bash",
+                                "input": {"command": "ls -la /tmp"},
+                            },
+                        },
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    items, byte_offset = forwarder._read_new_kiro_messages(jsonl_path, 0)
+
+    assert items == [
+        forwarder.KiroToolCall(
+            message_id="assistant-1",
+            call_id="tooluse_abc123",
+            name="execute_bash",
+            arguments={"command": "ls -la /tmp"},
+        ),
+    ]
+    assert byte_offset == jsonl_path.stat().st_size
+
+
+def test_read_new_kiro_messages_extracts_text_and_tool_use_together(tmp_path: Path) -> None:
+    """A turn with both narration text and a tool call forwards both, text first."""
+    jsonl_path = tmp_path / "session.jsonl"
+    jsonl_path.write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "assistant-1",
+                    "content": [
+                        {"kind": "text", "data": "Let me check that."},
+                        {
+                            "kind": "toolUse",
+                            "data": {
+                                "toolUseId": "tooluse_xyz",
+                                "name": "read",
+                                "input": {"path": "/etc/hosts"},
+                            },
+                        },
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    items, _ = forwarder._read_new_kiro_messages(jsonl_path, 0)
+
+    assert items == [
+        forwarder._KiroConversationMessage(
+            message_id="assistant-1", role="assistant", text="Let me check that."
+        ),
+        forwarder.KiroToolCall(
+            message_id="assistant-1",
+            call_id="tooluse_xyz",
+            name="read",
+            arguments={"path": "/etc/hosts"},
+        ),
+    ]
+
+
+def test_read_new_kiro_messages_extracts_tool_results(tmp_path: Path) -> None:
+    """toolResult blocks inside a ToolResults record forward as KiroToolResult items."""
+    jsonl_path = tmp_path / "session.jsonl"
+    jsonl_path.write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "kind": "ToolResults",
+                "data": {
+                    "message_id": "toolresults-1",
+                    "content": [
+                        {
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "tooluse_abc123",
+                                "content": [{"kind": "text", "data": "total 0\ndrwx------ ..."}],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    items, _ = forwarder._read_new_kiro_messages(jsonl_path, 0)
+
+    assert items == [
+        forwarder.KiroToolResult(
+            message_id="toolresults-1",
+            call_id="tooluse_abc123",
+            output="total 0\ndrwx------ ...",
+        ),
+    ]
+
+
+def test_read_new_kiro_messages_tool_result_with_no_text_forwards_empty_output(
+    tmp_path: Path,
+) -> None:
+    """A non-text tool result (e.g. an image) forwards with empty output rather
+    than being dropped — the call still gets a matching output item."""
+    jsonl_path = tmp_path / "session.jsonl"
+    jsonl_path.write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "kind": "ToolResults",
+                "data": {
+                    "message_id": "toolresults-1",
+                    "content": [
+                        {
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "tooluse_img",
+                                "content": [{"kind": "image", "data": {"format": "png"}}],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    items, _ = forwarder._read_new_kiro_messages(jsonl_path, 0)
+
+    assert items == [
+        forwarder.KiroToolResult(message_id="toolresults-1", call_id="tooluse_img", output=""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_posts_tool_calls_and_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One forwarder poll dispatches tool calls/results to their own posters."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "assistant-1",
+                    "content": [
+                        {"kind": "text", "data": ""},
+                        {
+                            "kind": "toolUse",
+                            "data": {
+                                "toolUseId": "tooluse_1",
+                                "name": "execute_bash",
+                                "input": {"command": "pwd"},
+                            },
+                        },
+                    ],
+                },
+            },
+            {
+                "version": "v1",
+                "kind": "ToolResults",
+                "data": {
+                    "message_id": "toolresults-1",
+                    "content": [
+                        {
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "tooluse_1",
+                                "content": [{"kind": "text", "data": "/home/lces"}],
+                            },
+                        }
+                    ],
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_calls: list[tuple[str, str, forwarder.KiroToolCall]] = []
+    posted_results: list[tuple[str, forwarder.KiroToolResult]] = []
+
+    async def _fake_post_call(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        agent_name: str,
+        call: forwarder.KiroToolCall,
+    ) -> None:
+        del client
+        posted_calls.append((session_id, agent_name, call))
+
+    async def _fake_post_result(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        result: forwarder.KiroToolResult,
+    ) -> None:
+        del client
+        posted_results.append((session_id, result))
+
+    async def _fake_patch_external_session_id(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        external_session_id: str,
+    ) -> None:
+        del client
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder, "_post_kiro_tool_call", _fake_post_call)
+    monkeypatch.setattr(forwarder, "_post_kiro_tool_result", _fake_post_result)
+    monkeypatch.setattr(
+        forwarder,
+        "_patch_external_session_id",
+        _fake_patch_external_session_id,
+    )
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    assert posted_calls == [
+        (
+            "conv_kiro",
+            "kiro-native-ui",
+            forwarder.KiroToolCall(
+                message_id="assistant-1",
+                call_id="tooluse_1",
+                name="execute_bash",
+                arguments={"command": "pwd"},
+            ),
+        ),
+    ]
+    assert posted_results == [
+        (
+            "conv_kiro",
+            forwarder.KiroToolResult(
+                message_id="toolresults-1", call_id="tooluse_1", output="/home/lces"
+            ),
+        ),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_forward_kiro_session_posts_conversation_messages(
     tmp_path: Path,
