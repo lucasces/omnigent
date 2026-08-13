@@ -392,6 +392,68 @@ def test_read_new_kiro_messages_extracts_tool_results(tmp_path: Path) -> None:
     ]
 
 
+def test_read_new_kiro_messages_extracts_json_shell_tool_result(tmp_path: Path) -> None:
+    """A shell/gh tool result comes back as ``kind: "json"``, not ``"text"``.
+
+    Real-world shape confirmed from a live Kiro session transcript: 243 of
+    350 persisted tool results were this shape (``{exit_status, stdout,
+    stderr}``), none of them ``kind: "text"``. Before this was handled, every
+    one of those silently forwarded as an empty-string output — the shell
+    command's actual result (including error messages) never reached the
+    mirrored conversation item.
+    """
+    jsonl_path = tmp_path / "session.jsonl"
+    jsonl_path.write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "kind": "ToolResults",
+                "data": {
+                    "message_id": "toolresults-1",
+                    "content": [
+                        {
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "tooluse_shell1",
+                                "content": [
+                                    {
+                                        "kind": "json",
+                                        "data": {
+                                            "exit_status": "exit status: 1",
+                                            "stdout": "failed to get runs: HTTP 404: Not Found\n",
+                                            "stderr": "",
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    items, _ = forwarder._read_new_kiro_messages(jsonl_path, 0)
+
+    assert items == [
+        forwarder.KiroToolResult(
+            message_id="toolresults-1",
+            call_id="tooluse_shell1",
+            output=json.dumps(
+                {
+                    "exit_status": "exit status: 1",
+                    "stdout": "failed to get runs: HTTP 404: Not Found\n",
+                    "stderr": "",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        ),
+    ]
+
+
 def test_read_new_kiro_messages_tool_result_with_no_text_forwards_empty_output(
     tmp_path: Path,
 ) -> None:

@@ -319,7 +319,19 @@ _parse_kiro_jsonl_line = parse_kiro_jsonl_line
 
 
 def _kiro_content_text(content: object) -> str:
-    """Join text blocks from Kiro's persisted message content."""
+    """Join text blocks from Kiro's persisted message content.
+
+    Tool results are the main consumer of the ``kind: "json"`` branch: a
+    shell/gh/grep tool result comes back from Kiro as
+    ``{"kind": "json", "data": {"exit_status": ..., "stdout": ..., "stderr":
+    ...}}`` (or another tool-specific shape), never as ``kind: "text"``. In a
+    real transcript sample, 243 of 350 tool results were this shape — treating
+    only ``kind: "text"`` as content silently turned the majority of mirrored
+    Kiro tool-call outputs into empty strings. Falls back to a compact JSON
+    dump, the same non-string-content handling
+    ``claude_native_bridge._tool_result_output`` uses for Claude's tool
+    results.
+    """
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -332,6 +344,8 @@ def _kiro_content_text(content: object) -> str:
             parts.append(block["data"])
         elif block.get("type") in {"text", "output_text"} and isinstance(block.get("text"), str):
             parts.append(block["text"])
+        elif block.get("kind") == "json" and "data" in block:
+            parts.append(json.dumps(block["data"], ensure_ascii=False, separators=(",", ":")))
     return "\n".join(parts)
 
 
