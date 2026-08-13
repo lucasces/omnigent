@@ -617,6 +617,222 @@ async def test_forward_kiro_session_posts_tool_calls_and_results(
 
 
 @pytest.mark.asyncio
+async def test_forward_kiro_session_reasserts_running_status_while_tool_call_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool call with no matching result yet gets a running status edge.
+
+    Reproduces the "looks finished but isn't" bug: the PTY-activity watcher's
+    ~1s pane-quiet idle threshold can't tell a genuinely finished turn apart
+    from a long, quiet command (a poll loop, a slow API call, a pending
+    approval prompt) — it settles the live tool card and turn-working
+    indicator within a second either way. This response_id-scoped running
+    edge (matching hermes_native_forwarder.py's #1874 pattern) is the signal
+    that keeps the card live for as long as the call is actually unresolved.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "assistant-1",
+                    "content": [
+                        {"kind": "text", "data": ""},
+                        {
+                            "kind": "toolUse",
+                            "data": {
+                                "toolUseId": "tooluse_1",
+                                "name": "execute_bash",
+                                "input": {"command": "sleep 30 && echo done"},
+                            },
+                        },
+                    ],
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_statuses: list[tuple[str, str, str | None]] = []
+
+    async def _fake_post_status(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        status: str,
+        response_id: str | None = None,
+    ) -> None:
+        del client
+        posted_statuses.append((session_id, status, response_id))
+
+    async def _noop_call(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        agent_name: str,
+        call: forwarder.KiroToolCall,
+    ) -> None:
+        del client
+
+    async def _noop_patch(
+        client: httpx.AsyncClient, *, session_id: str, external_session_id: str
+    ) -> None:
+        del client
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder, "_post_external_session_status", _fake_post_status)
+    monkeypatch.setattr(forwarder, "_post_kiro_tool_call", _noop_call)
+    monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    assert posted_statuses == [("conv_kiro", "running", "kiro:assistant-1")]
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_stops_reasserting_status_once_call_resolves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once a tool call's result lands, the next poll stops reasserting it.
+
+    The result arrives on the second poll (appended to the JSONL between the
+    first and second tick, mimicking Kiro finishing the command mid-forward).
+    The running edge should have been posted exactly once — for the first
+    tick, while the call was still pending — and not again on the second.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    jsonl_path = _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "assistant-1",
+                    "content": [
+                        {"kind": "text", "data": ""},
+                        {
+                            "kind": "toolUse",
+                            "data": {
+                                "toolUseId": "tooluse_1",
+                                "name": "execute_bash",
+                                "input": {"command": "sleep 1"},
+                            },
+                        },
+                    ],
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_statuses: list[tuple[str, str, str | None]] = []
+
+    async def _fake_post_status(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        status: str,
+        response_id: str | None = None,
+    ) -> None:
+        del client
+        posted_statuses.append((session_id, status, response_id))
+
+    async def _noop_call(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        agent_name: str,
+        call: forwarder.KiroToolCall,
+    ) -> None:
+        del client
+
+    async def _noop_result(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        result: forwarder.KiroToolResult,
+    ) -> None:
+        del client
+
+    calls = {"n": 0}
+
+    async def _append_result_then_cancel(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError
+        with jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "version": "v1",
+                        "kind": "ToolResults",
+                        "data": {
+                            "message_id": "toolresults-1",
+                            "content": [
+                                {
+                                    "kind": "toolResult",
+                                    "data": {
+                                        "toolUseId": "tooluse_1",
+                                        "content": [{"kind": "text", "data": "ok"}],
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+    async def _noop_patch(
+        client: httpx.AsyncClient, *, session_id: str, external_session_id: str
+    ) -> None:
+        del client
+
+    monkeypatch.setattr(forwarder, "_post_external_session_status", _fake_post_status)
+    monkeypatch.setattr(forwarder, "_post_kiro_tool_call", _noop_call)
+    monkeypatch.setattr(forwarder, "_post_kiro_tool_result", _noop_result)
+    monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _append_result_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    assert posted_statuses == [("conv_kiro", "running", "kiro:assistant-1")]
+
+
+@pytest.mark.asyncio
 async def test_forward_kiro_session_posts_conversation_messages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
