@@ -137,6 +137,7 @@ export type RenderItem =
         reason: string | null;
         execPolicyAmendment: string[] | null;
       } | null;
+      kiroCommand?: { command: string } | null;
       allowAllEdits?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
@@ -1546,6 +1547,7 @@ function buildAssistantItems(
         askUserQuestion: b.askUserQuestion,
         exitPlanMode: b.exitPlanMode,
         codexCommand: b.codexCommand,
+        kiroCommand: b.kiroCommand,
         allowAllEdits: b.allowAllEdits,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,

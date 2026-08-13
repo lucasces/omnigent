@@ -240,6 +240,13 @@ export interface ElicitationRequest {
     execPolicyAmendment: string[] | null;
   } | null;
   /**
+   * Producer-supplied extra (kiro-native command approvals only): the
+   * FULL command text, untruncated — bypasses the 1024-char
+   * ``contentPreview`` cap shared by every native-permission producer,
+   * which was cutting long Kiro commands off before a human saw them.
+   */
+  kiroCommand?: { command: string } | null;
+  /**
    * Producer-supplied extra (claude-native edit-tool prompts only):
    * when true, the PermissionRequest endpoint is gating a file-editing
    * tool (Edit/Write/MultiEdit/NotebookEdit) under a mode that still

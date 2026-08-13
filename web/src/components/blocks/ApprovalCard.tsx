@@ -142,6 +142,12 @@ interface ApprovalCardProps {
     execPolicyAmendment: string[] | null;
   } | null;
   /**
+   * Structured Kiro command-approval details. When present, the card
+   * renders the full untruncated command in a scrollable block instead
+   * of the capped `contentPreview` string.
+   */
+  kiroCommand?: { command: string } | null;
+  /**
    * Claude-native edit-tool prompts only: when true, the binary
    * approve/reject card grows a third "Accept & allow all edits"
    * button. Accepting through it asks the server to switch the
@@ -188,6 +194,7 @@ export function ApprovalCard({
   askUserQuestion,
   exitPlanMode,
   codexCommand,
+  kiroCommand,
   allowAllEdits,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
@@ -273,6 +280,7 @@ export function ApprovalCard({
     askPayload === null && !isMultiChoice ? schemaFields(requestedSchema) : [];
   const isSchemaForm = schemaFormFields.length > 0;
   const isCodexCommandApproval = codexCommand !== null && codexCommand !== undefined;
+  const isKiroCommandApproval = kiroCommand !== null && kiroCommand !== undefined;
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
   // paths are handled inline with approve/reject buttons.
@@ -300,11 +308,16 @@ export function ApprovalCard({
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
-  // button mode (the buttons render the choices). Codex command
-  // approvals get a dedicated command render below, so showing the
-  // transport JSON would expose unrelated ids and duplicate details.
+  // button mode (the buttons render the choices). Codex and Kiro
+  // command approvals get a dedicated command render below, so showing
+  // the transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
+    isAskUserQuestion ||
+    isExitPlanMode ||
+    isMultiChoice ||
+    isSchemaForm ||
+    isCodexCommandApproval ||
+    isKiroCommandApproval
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -531,6 +544,10 @@ export function ApprovalCard({
                   </span>
                 )}
               </>
+            ) : isKiroCommandApproval ? (
+              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
+                {kiroCommand.command}
+              </pre>
             ) : showGatingMessage ? (
               <span>{message}</span>
             ) : null}
@@ -565,14 +582,14 @@ export function ApprovalCard({
       className="flex flex-col gap-2 py-3 px-4"
     >
       <AlertTitle className="flex items-center gap-2 text-ui">
-        {isCodexCommandApproval ? (
+        {isCodexCommandApproval || isKiroCommandApproval ? (
           <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
         ) : isExitPlanMode ? (
           <ClipboardListIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
         ) : (
           <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
         )}
-        {isCodexCommandApproval
+        {isCodexCommandApproval || isKiroCommandApproval
           ? "Command approval"
           : isExitPlanMode
             ? "Plan review"
@@ -619,6 +636,14 @@ export function ApprovalCard({
               </span>
             )}
             {codexCommandButtons}
+          </>
+        ) : isKiroCommandApproval ? (
+          <>
+            <span>Kiro wants to run this command.</span>
+            <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap break-words">
+              {kiroCommand.command}
+            </pre>
+            {binaryButtons}
           </>
         ) : (
           <>
@@ -694,6 +719,7 @@ export function ElicitationCard({
       askUserQuestion={item.askUserQuestion}
       exitPlanMode={item.exitPlanMode}
       codexCommand={item.codexCommand}
+      kiroCommand={item.kiroCommand}
       allowAllEdits={item.allowAllEdits}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}

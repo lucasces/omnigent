@@ -1091,6 +1091,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                   : null,
             }
           : null,
+      // Same `command` extra as codexCommand above, stamped by the
+      // kiro-native mirror instead (native_permission_request_hook).
+      // Untruncated — bypasses the 1024-char content_preview cap that
+      // was cutting long Kiro commands off in the approval dialog.
+      kiroCommand:
+        policyName === "kiro_native_permission" && typeof command === "string" && command
+          ? { command }
+          : null,
       allowAllEdits,
       rememberScope,
       codexPersistModes,
