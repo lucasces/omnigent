@@ -363,6 +363,16 @@ async def _run_one_permission(
             "operation_type": "tool",
             "message": f"Kiro wants approval for {permission.preview}",
             "content_preview": permission.preview,
+            # Untruncated: Kiro's ACP tool_call title is often the full
+            # shell command, and the 1024-char content_preview cap
+            # (shared by every native-permission producer, see
+            # ``_PREVIEW_MAX``) was silently cutting long commands off
+            # in the approval dialog before a human ever saw the rest.
+            # The web UI renders this separately, in a scrollable block
+            # that isn't subject to that cap (see ApprovalCard's
+            # ``kiroCommand`` branch) — same technique
+            # ``_codex_command_approval_params`` uses for Codex.
+            "command": permission.title,
         }
         response = await _post_hook_with_retry(
             client, session_id=session_id, payload=payload

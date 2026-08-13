@@ -485,6 +485,12 @@ export interface ElicitationBlock {
     execPolicyAmendment: string[] | null;
   } | null;
   /**
+   * Structured Kiro command-approval payload. Present for kiro-native
+   * command approvals so the card can show the full command without
+   * the 1024-char contentPreview truncation.
+   */
+  kiroCommand?: { command: string } | null;
+  /**
    * Claude-native edit-tool prompts only: when true, the card renders
    * an "Accept & allow all edits" button that switches the session
    * into Claude Code's ``acceptEdits`` mode on accept (the web

@@ -1317,6 +1317,17 @@ def register_hooks_routes(
         policy_name = payload.get("policy_name")
         if not isinstance(policy_name, str) or not policy_name:
             policy_name = "native_permission"
+        # Optional untruncated command, currently only sent by the
+        # kiro-native mirror (see kiro_native_permissions.py). Rides
+        # through under ElicitationRequestParams' `extra="allow"` — same
+        # mechanism `_codex_command_approval_params` uses for Codex's
+        # `command` field — so hermes/goose (which don't send it) are
+        # unaffected. `content_preview` still carries the capped 1024-char
+        # summary for any consumer that only wants a short preview.
+        command = payload.get("command")
+        extras: dict[str, Any] = {}
+        if isinstance(command, str) and command:
+            extras["command"] = command
         params = ElicitationRequestParams(
             mode="form",
             message=message,
@@ -1325,6 +1336,7 @@ def register_hooks_routes(
             phase="pre_tool_use",
             policy_name=policy_name,
             content_preview=content_preview,
+            **extras,
         )
         from omnigent.server.routes import sessions as _sf
 
