@@ -1395,6 +1395,16 @@ def register_hooks_routes(
             ask_user_question.get("questions"), list
         ):
             extras["ask_user_question"] = ask_user_question
+        # Optional untruncated command, currently only sent by the
+        # kiro-native mirror (see kiro_native_permissions.py). Rides
+        # through under ElicitationRequestParams' `extra="allow"` — same
+        # mechanism `_codex_command_approval_params` uses for Codex's
+        # `command` field — so hermes/goose (which don't send it) are
+        # unaffected. `content_preview` still carries the capped 1024-char
+        # summary for any consumer that only wants a short preview.
+        command = payload.get("command")
+        if isinstance(command, str) and command:
+            extras["command"] = command
         params = ElicitationRequestParams(
             mode="form",
             message=message,
