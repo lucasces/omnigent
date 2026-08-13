@@ -527,6 +527,38 @@ async def _post_kiro_tool_result(
     resp.raise_for_status()
 
 
+async def _post_external_session_status(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    status: str,
+    response_id: str | None = None,
+) -> None:
+    """POST one ``external_session_status`` event to the Sessions API.
+
+    Same contract ``hermes_native_forwarder.py`` uses (#1874): when
+    *response_id* is given, the edge carries it, and the server keys the live
+    tool-call card off a ``running`` edge whose ``response_id`` matches the
+    mirrored item's ``response_id`` — reasserting this each poll while a call
+    is in-flight keeps the card (and the turn-working indicator) live through
+    a long, quiet command that the PTY-activity watcher's ~1s idle threshold
+    would otherwise settle within a second. Only ``"running"`` is ever posted
+    here; unlike hermes, this forwarder does not take ``idle`` ownership —
+    that stays with the PTY watcher, avoiding the double-sourcing #1137 was
+    about.
+
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    data: dict[str, object] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    resp.raise_for_status()
+
+
 async def _patch_external_session_id(
     client: httpx.AsyncClient,
     *,
@@ -716,6 +748,18 @@ async def forward_kiro_session_to_omnigent(
     last_posted_model: str | None = None
     from omnigent.cli_auth import open_server_client
 
+    # Tracks tool calls posted (as ``function_call`` items) whose matching
+    # ``function_call_output`` hasn't arrived yet, keyed by the owning
+    # AssistantMessage's ``message_id`` (the same id used as the calls'
+    # ``response_id``, ``f"kiro:{message_id}"``). Reset on process restart —
+    # acceptable, since a restart mid-call just means the PTY watcher's own
+    # idle heuristic (the pre-existing behavior) takes back over for that one
+    # call instead of this reassertion. See the reassertion loop below for why
+    # this exists.
+    pending_calls_by_message: dict[str, set[str]] = {}
+    # Reverse index for resolving a KiroToolResult (which carries only the
+    # ``call_id``) back to the message_id whose pending set it should clear.
+    call_id_to_message: dict[str, str] = {}
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
@@ -755,13 +799,23 @@ async def forward_kiro_session_to_omnigent(
                         state.byte_offset,
                     )
                     for item in items:
-                        # Mirror the transcript only. Running/idle status for
-                        # kiro-native is owned by the PTY watcher's ``emit_status``
-                        # (``runner/resource_registry.py``), matching the other
-                        # forwarder-backed native harnesses (goose/qwen/hermes),
-                        # whose forwarders mirror the transcript, not the
-                        # running/idle session status. Posting status here too
-                        # double-sourced it (#1137).
+                        # Mirror the transcript. Turn-level running/idle status
+                        # for kiro-native is still owned by the PTY watcher's
+                        # ``emit_status`` (``runner/resource_registry.py``),
+                        # matching the other forwarder-backed native harnesses
+                        # (goose/qwen) — this forwarder never posts an ``idle``
+                        # edge, avoiding the double-sourcing that #1137 was
+                        # about. It DOES reassert a response_id-scoped
+                        # ``running`` edge below while a tool call is
+                        # in-flight, the same technique
+                        # hermes_native_forwarder.py uses (#1874): the PTY
+                        # watcher's ~1s pane-quiet idle threshold can't tell a
+                        # genuinely finished turn from a long, quiet command
+                        # (a poll loop, a slow API call, a pending approval
+                        # prompt) — without this, such a command settles the
+                        # live tool card and the turn-working indicator within
+                        # a second of starting, even though the command (and
+                        # the turn) is still very much running.
                         if isinstance(item, KiroConversationMessage):
                             await _post_conversation_message(
                                 client,
@@ -776,12 +830,30 @@ async def forward_kiro_session_to_omnigent(
                                 agent_name=agent_name,
                                 call=item,
                             )
+                            call_id_to_message[item.call_id] = item.message_id
+                            pending_calls_by_message.setdefault(item.message_id, set()).add(
+                                item.call_id
+                            )
                         else:
                             await _post_kiro_tool_result(
                                 client,
                                 session_id=session_id,
                                 result=item,
                             )
+                            owning_message_id = call_id_to_message.pop(item.call_id, None)
+                            if owning_message_id is not None:
+                                pending = pending_calls_by_message.get(owning_message_id)
+                                if pending is not None:
+                                    pending.discard(item.call_id)
+                                    if not pending:
+                                        del pending_calls_by_message[owning_message_id]
+                    for pending_message_id in list(pending_calls_by_message):
+                        await _post_external_session_status(
+                            client,
+                            session_id=session_id,
+                            status="running",
+                            response_id=f"kiro:{pending_message_id}",
+                        )
                     if byte_offset != state.byte_offset:
                         state.byte_offset = byte_offset
                         _write_state(bridge_dir, state)
