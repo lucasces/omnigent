@@ -147,6 +147,14 @@ interface ApprovalCardProps {
    */
   allowAllEdits?: boolean;
   /**
+   * Kiro-native permission prompts only: when true, the binary
+   * approve/reject card grows a third "Approve & trust for this session"
+   * button. Accepting through it asks the runner-side mirror to select
+   * Kiro's own "Trust, always allow in this session" TUI option instead of
+   * a one-time allow. Absent/false for every other elicitation.
+   */
+  kiroTrustAlways?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: when set, the binary
    * approve/reject card grows a third "Approve & don't ask again for
    * <host|tool>" button. Accepting through it asks the server to
@@ -181,6 +189,7 @@ export function ApprovalCard({
   codexCommand,
   kiroCommand,
   allowAllEdits,
+  kiroTrustAlways,
   rememberScope,
   onSubmit,
 }: ApprovalCardProps) {
@@ -214,6 +223,14 @@ export function ApprovalCard({
     // gated tool is ExitPlanMode (the plan card's "Yes, and use auto
     // mode" action — same flag, server picks the mode).
     submit(elicitationId, "accept", { allow_all_edits: true });
+  };
+  const submitTrustAlways = () => {
+    // Accept AND ask the runner-side mirror to select Kiro's own "Trust,
+    // always allow in this session" TUI option instead of the one-time
+    // allow. The server reads ``content.kiro_trust_always`` and forwards it
+    // straight through unchanged (no policy-engine derivation needed —
+    // unlike ``remember``, Kiro owns the actual trust scope).
+    submit(elicitationId, "accept", { kiro_trust_always: true });
   };
   const submitRemember = () => {
     // Accept AND ask the server to install a session-scoped allow rule
@@ -294,6 +311,7 @@ export function ApprovalCard({
     Array.isArray(response?.content?.execpolicy_amendment) &&
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
+  const acceptedTrustAlways = response?.content?.kiro_trust_always === true;
   const acceptedRemember = response?.content?.remember === true;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
@@ -322,6 +340,17 @@ export function ApprovalCard({
         >
           <CheckIcon className="mr-1 size-3.5" />
           Accept & allow all edits
+        </Button>
+      )}
+      {kiroTrustAlways && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitTrustAlways}
+          data-testid="approval-card-trust-always"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve & trust for this session
         </Button>
       )}
       {rememberTarget && (
@@ -430,6 +459,9 @@ export function ApprovalCard({
     } else if (acceptedAllEdits) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
+    } else if (acceptedTrustAlways) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved · trusted for this session";
     } else if (acceptedRemember) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = rememberTarget
@@ -652,6 +684,7 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       kiroCommand={item.kiroCommand}
       allowAllEdits={item.allowAllEdits}
+      kiroTrustAlways={item.kiroTrustAlways}
       rememberScope={item.rememberScope}
       onSubmit={onSubmit}
     />

@@ -9,6 +9,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -21,6 +22,7 @@ _POST_TIMEOUT_S = 86400.0
 _PREVIEW_MAX = 1024
 _SUPPORTED_ACCEPT_OPTION = "allow_once"
 _SUPPORTED_DECLINE_OPTION = "reject_once"
+_SUPPORTED_ALWAYS_OPTION = "allow_always"
 # Retry budget for the initial hook POST that parks an approval on the
 # server. A transient blip there (observed: a single 502 from the proxy in
 # front of the server, pod logs otherwise clean) previously meant the
@@ -41,6 +43,12 @@ class KiroPermissionRequest:
     title: str
     accept_option_id: str
     decline_option_id: str
+    # Kiro's TUI offers a third "Trust, always allow in this session" option
+    # alongside the one-time allow/decline pair on (in practice) every
+    # permission prompt. Optional rather than required so a future Kiro build
+    # that omits it for some prompt kinds degrades to the binary card instead
+    # of dropping the whole request (see the accept/decline guard below).
+    always_option_id: str | None = None
 
     @property
     def preview(self) -> str:
@@ -144,6 +152,7 @@ def parse_permission_request(message: dict[str, object]) -> KiroPermissionReques
         return None
     accept_option_id: str | None = None
     decline_option_id: str | None = None
+    always_option_id: str | None = None
     for option in options:
         if not isinstance(option, dict):
             continue
@@ -155,6 +164,8 @@ def parse_permission_request(message: dict[str, object]) -> KiroPermissionReques
             accept_option_id = option_id
         elif kind == _SUPPORTED_DECLINE_OPTION:
             decline_option_id = option_id
+        elif kind == _SUPPORTED_ALWAYS_OPTION:
+            always_option_id = option_id
     if not accept_option_id or not decline_option_id:
         return None
     return KiroPermissionRequest(
@@ -163,6 +174,7 @@ def parse_permission_request(message: dict[str, object]) -> KiroPermissionReques
         title=title.strip(),
         accept_option_id=accept_option_id,
         decline_option_id=decline_option_id,
+        always_option_id=always_option_id,
     )
 
 
@@ -356,7 +368,7 @@ async def _run_one_permission(
     hook response was enough to silently stall every subsequent approval).
     """
     try:
-        payload = {
+        payload: dict[str, Any] = {
             "elicitation_id": elicitation_id,
             "agent": "Kiro",
             "policy_name": "kiro_native_permission",
@@ -374,9 +386,14 @@ async def _run_one_permission(
             # ``_codex_command_approval_params`` uses for Codex.
             "command": permission.title,
         }
-        response = await _post_hook_with_retry(
-            client, session_id=session_id, payload=payload
-        )
+        # Tells the server this prompt also has Kiro's "Trust, always allow
+        # in this session" option, so the web card can grow the third
+        # button (see ApprovalCard's ``kiroTrustAlways`` prop). Omitted
+        # (rather than sent as false) when Kiro didn't offer that option on
+        # this particular prompt.
+        if permission.always_option_id:
+            payload["kiro_trust_always"] = True
+        response = await _post_hook_with_retry(client, session_id=session_id, payload=payload)
         if response is None:
             # Retries exhausted — the elicitation card was never created, so
             # Kiro's TUI is now waiting on a decision the web UI never got a
@@ -420,6 +437,23 @@ async def _run_one_permission(
         action = result.get("action") if isinstance(result, dict) else None
         if action not in {"accept", "decline", "cancel"}:
             return
+        # The wire ``action`` is always accept/decline/cancel (MCP's
+        # ElicitResult shape — see ElicitationResult in server/schemas.py);
+        # "trust always" rides as a content flag on an accepted verdict,
+        # mirroring how Claude-native's "remember"/"allow_all_edits" extras
+        # work. Only honored when THIS prompt actually offered Kiro's
+        # "Trust, always allow" option — a stray flag on an ineligible
+        # prompt (e.g. one Kiro didn't offer it for) falls back to a normal
+        # one-time accept rather than erroring.
+        content = result.get("content") if isinstance(result, dict) else None
+        deliver_action = action
+        if (
+            action == "accept"
+            and permission.always_option_id
+            and isinstance(content, dict)
+            and content.get("kiro_trust_always") is True
+        ):
+            deliver_action = "allow_always"
         # Wait until this is the oldest still-unanswered request before
         # touching the shared tmux pane — Kiro only ever shows one prompt at
         # a time, and it's always this one's turn only once every older
@@ -429,7 +463,7 @@ async def _run_one_permission(
             await asyncio.to_thread(
                 send_kiro_permission_verdict,
                 bridge_dir,
-                action=action,
+                action=deliver_action,
             )
         except RuntimeError:
             _logger.exception(
@@ -456,7 +490,7 @@ async def _run_one_permission(
 
 
 async def _post_hook_with_retry(
-    client: httpx.AsyncClient, *, session_id: str, payload: dict[str, str]
+    client: httpx.AsyncClient, *, session_id: str, payload: dict[str, Any]
 ) -> httpx.Response | None:
     """POST the native-permission-request hook, retrying transient failures.
 
