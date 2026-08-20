@@ -45,7 +45,6 @@ _PERMISSION_PANE_REJECT_FOCUSED = _PERMISSION_PANE.replace(
     "❯ Yes, single permission\n   Trust, always allow in this session\n   No (Tab to edit)",
     "  Yes, single permission\n   Trust, always allow in this session\n ❯ No (Tab to edit)",
 )
-_PERMISSION_PANE_DATE = _PERMISSION_PANE.replace("↓ Shell pwd", "↓ Shell date")
 
 
 def _install_fake_tmux(
@@ -126,9 +125,7 @@ def test_send_kiro_permission_verdict_accepts_default_option(
         tmux_target="main",
     )
 
-    send_kiro_permission_verdict(
-        bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.1
-    )
+    send_kiro_permission_verdict(bridge_dir, action="accept", timeout_s=0.1)
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Enter"]
@@ -154,9 +151,7 @@ def test_send_kiro_permission_verdict_refuses_accept_when_focus_drifts_after_set
     )
 
     with pytest.raises(RuntimeError, match="allow option was not safely focused"):
-        send_kiro_permission_verdict(
-            bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.1
-        )
+        send_kiro_permission_verdict(bridge_dir, action="accept", timeout_s=0.1)
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == []
@@ -182,9 +177,7 @@ def test_send_kiro_permission_verdict_declines_with_slow_navigation(
         tmux_target="main",
     )
 
-    send_kiro_permission_verdict(
-        bridge_dir, action="decline", expected_title="Running: pwd", timeout_s=0.1
-    )
+    send_kiro_permission_verdict(bridge_dir, action="decline", timeout_s=0.1)
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Down", "Down", "Enter"]
@@ -269,48 +262,7 @@ def test_send_kiro_permission_verdict_refuses_when_focus_moved_to_trust(
     )
 
     with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
-        send_kiro_permission_verdict(
-            bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.01
-        )
-
-
-def test_send_kiro_permission_verdict_refuses_when_prompt_title_differs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/tmux.sock"),
-        tmux_target="main",
-    )
-
-    with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
-        send_kiro_permission_verdict(
-            bridge_dir, action="accept", expected_title="Running: date", timeout_s=0.01
-        )
-
-
-def test_send_kiro_permission_verdict_ignores_matching_text_outside_active_prompt(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
-    pane = "old transcript mentioned Running: pwd\n" + _PERMISSION_PANE_DATE
-    bridge_dir = tmp_path / "bridge"
-    _install_fake_tmux(monkeypatch, pane_outputs=[pane])
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/tmux.sock"),
-        tmux_target="main",
-    )
-
-    with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
-        send_kiro_permission_verdict(
-            bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.01
-        )
+        send_kiro_permission_verdict(bridge_dir, action="accept", timeout_s=0.01)
 
 
 def test_send_kiro_permission_verdict_refuses_decline_when_reject_not_focused(
@@ -332,9 +284,7 @@ def test_send_kiro_permission_verdict_refuses_decline_when_reject_not_focused(
     )
 
     with pytest.raises(RuntimeError, match="reject option was not safely focused"):
-        send_kiro_permission_verdict(
-            bridge_dir, action="decline", expected_title="Running: pwd", timeout_s=0.01
-        )
+        send_kiro_permission_verdict(bridge_dir, action="decline", timeout_s=0.01)
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Down", "Down"]

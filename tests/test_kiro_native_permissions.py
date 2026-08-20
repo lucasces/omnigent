@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
 from pathlib import Path
 
 import httpx
@@ -419,10 +420,25 @@ async def test_supervise_mirror_skips_request_resolved_in_same_poll_batch(
 
 
 @pytest.mark.asyncio
-async def test_supervise_mirror_skips_additional_request_while_one_is_pending(
+async def test_supervise_mirror_serializes_keystroke_delivery_via_coordinator(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """The coordinator — not the poll loop — is what now serializes delivery.
+
+    Before the ``_DeliveryCoordinator`` refactor (e1a2f802), the poll loop
+    itself held a single "pending" slot and would not even start a second
+    request's task until the first was done. Now every new request gets its
+    own task immediately (see the ``pending`` dict in
+    :func:`supervise_kiro_permission_mirror`); what's serialized is only the
+    tmux keystroke delivery inside :func:`_run_one_permission`, gated by
+    ``coordinator.wait_turn()``. This drives the real ``_run_one_permission``
+    (rather than mocking it away, which would bypass the coordinator
+    entirely) and blocks the first request's ``send_kiro_permission_verdict``
+    call to prove the second request's call cannot start until the first
+    one's keystroke delivery finishes and releases the coordinator slot.
+    """
+
     class _FakeAsyncClient:
         def __init__(self, **_kw: object) -> None:
             pass
@@ -434,19 +450,27 @@ async def test_supervise_mirror_skips_additional_request_while_one_is_pending(
             return False
 
         async def post(self, url: str, *, json: dict, **_kw: object) -> httpx.Response:
+            if "native-permission-request" in url:
+                return httpx.Response(200, json={"action": "accept"})
             return httpx.Response(200, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(knp.httpx, "AsyncClient", _FakeAsyncClient)
-    started = asyncio.Event()
-    release = asyncio.Event()
-    run_one_calls: list[str] = []
 
-    async def _fake_run_one(_client: object, *, permission: object, **_kw: object) -> None:
-        run_one_calls.append(permission.request_id)  # type: ignore[attr-defined]
-        started.set()
-        await release.wait()
+    delivery_order: list[int] = []
+    first_call_blocking = threading.Event()
+    release_first = threading.Event()
 
-    monkeypatch.setattr(knp, "_run_one_permission", _fake_run_one)
+    def _fake_send(bridge_dir: Path, *, action: str) -> None:
+        # Runs off the event loop thread (via asyncio.to_thread), so blocking
+        # here does not stall req-2's task from reaching its own
+        # coordinator.wait_turn() — only from getting PAST it.
+        index = len(delivery_order)
+        delivery_order.append(index)
+        if index == 0:
+            first_call_blocking.set()
+            assert release_first.wait(timeout=2.0), "test never released the first delivery"
+
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
     record_file = acp_record_path(tmp_path)
     record_file.write_bytes(b"")
 
@@ -463,13 +487,22 @@ async def test_supervise_mirror_skips_additional_request_while_one_is_pending(
         await asyncio.sleep(0.05)
         with record_file.open("ab") as handle:
             handle.write(_record_bytes(_permission_msg("req-1")))
-        await asyncio.wait_for(started.wait(), 2.0)
+        await asyncio.wait_for(asyncio.to_thread(first_call_blocking.wait, 2.0), timeout=2.0)
         with record_file.open("ab") as handle:
             handle.write(_record_bytes(_permission_msg("req-2")))
         await asyncio.sleep(0.05)
-        assert run_one_calls == ["req-1"]
+        # req-2's task reached wait_turn() but cannot deliver its keystroke
+        # yet — req-1 still holds the coordinator slot.
+        assert delivery_order == [0]
+
+        release_first.set()
+        for _ in range(400):
+            if delivery_order == [0, 1]:
+                break
+            await asyncio.sleep(0.005)
+        assert delivery_order == [0, 1]
     finally:
-        release.set()
+        release_first.set()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
