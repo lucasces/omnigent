@@ -139,6 +139,7 @@ export type RenderItem =
       } | null;
       kiroCommand?: { command: string } | null;
       allowAllEdits?: boolean;
+      kiroTrustAlways?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
     };
@@ -1601,6 +1602,7 @@ function buildAssistantItems(
         codexCommand: b.codexCommand,
         kiroCommand: b.kiroCommand,
         allowAllEdits: b.allowAllEdits,
+        kiroTrustAlways: b.kiroTrustAlways,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
       });

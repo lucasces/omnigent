@@ -1405,6 +1405,13 @@ def register_hooks_routes(
         command = payload.get("command")
         if isinstance(command, str) and command:
             extras["command"] = command
+        # Stamped only by the kiro-native mirror (kiro_native_permissions.py)
+        # when the live prompt actually offers Kiro's "Trust, always allow in
+        # this session" option. Drives ApprovalCard's third
+        # "Approve & trust for this session" button; hermes/goose (which
+        # don't send it) are unaffected.
+        if payload.get("kiro_trust_always") is True:
+            extras["kiro_trust_always"] = True
         params = ElicitationRequestParams(
             mode="form",
             message=message,

@@ -624,6 +624,13 @@ export interface ElicitationBlock {
    */
   allowAllEdits?: boolean;
   /**
+   * Kiro-native permission prompts only: when true, the card renders an
+   * "Approve & trust for this session" button that selects Kiro's "Trust,
+   * always allow in this session" TUI option on accept, instead of a
+   * one-time allow. Absent/false for all other elicitations.
+   */
+  kiroTrustAlways?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button
    * that installs a session-scoped allow rule on accept (the web

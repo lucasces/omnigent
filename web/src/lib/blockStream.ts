@@ -918,6 +918,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         codexCommand: event.codexCommand,
         kiroCommand: event.kiroCommand,
         allowAllEdits: event.allowAllEdits,
+        kiroTrustAlways: event.kiroTrustAlways,
         rememberScope: event.rememberScope,
         codexPersistModes: event.codexPersistModes,
       } satisfies ElicitationBlock;

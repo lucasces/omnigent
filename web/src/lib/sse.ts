@@ -1018,6 +1018,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // offers the "Accept & allow all edits" button (switches the
     // session to acceptEdits mode on accept).
     const allowAllEdits = p.allow_all_edits === true;
+    // kiro-native permission mirror stamps this when the live prompt also
+    // offers Kiro's "Trust, always allow in this session" option (see
+    // kiro_native_permissions.py). Drives ApprovalCard's third
+    // "Approve & trust for this session" button.
+    const kiroTrustAlways = p.kiro_trust_always === true;
     // claude-native non-edit tool prompts stamp this so the ApprovalCard
     // offers the persistent "don't ask again" button (installs a
     // session-scoped allow rule on accept). `tool` is the gated tool;
@@ -1101,6 +1106,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? { command }
           : null,
       allowAllEdits,
+      kiroTrustAlways,
       rememberScope,
       codexPersistModes,
     } satisfies ElicitationRequest;

@@ -385,7 +385,18 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     """
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-p", "-J", "-S", "-300", "-t", tmux_target],
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "capture-pane",
+                "-p",
+                "-J",
+                "-S",
+                "-300",
+                "-t",
+                tmux_target,
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -468,6 +479,14 @@ def _kiro_permission_focus_on_one_time_allow(pane: str) -> bool:
     return any(line.strip().startswith("❯ Yes, single permission") for line in pane.splitlines())
 
 
+def _kiro_permission_focus_on_always_allow(pane: str) -> bool:
+    """Return whether Kiro's approval picker is focused on trust-always."""
+    return any(
+        line.strip().startswith("❯ Trust, always allow in this session")
+        for line in pane.splitlines()
+    )
+
+
 def _kiro_permission_focus_on_reject(pane: str) -> bool:
     """Return whether Kiro's approval picker is focused on one-time reject."""
     return any(line.strip().startswith("❯ No (Tab to edit)") for line in pane.splitlines())
@@ -495,9 +514,7 @@ def _wait_for_kiro_permission_prompt(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(
-            pane
-        ):
+        if _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(pane):
             return
         time.sleep(_POLL_INTERVAL_S)
     raise RuntimeError(
@@ -695,8 +712,8 @@ def send_kiro_permission_verdict(
     action: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
-    """Deliver a one-time Kiro permission verdict to the active TUI prompt."""
-    if action not in {"accept", "decline", "cancel"}:
+    """Deliver a one-time or trust-always Kiro permission verdict to the active TUI prompt."""
+    if action not in {"accept", "decline", "cancel", "allow_always"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
@@ -713,6 +730,24 @@ def send_kiro_permission_verdict(
             _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(pane)
         ):
             raise RuntimeError("kiro-native allow option was not safely focused before delivery")
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+        return
+    if action == "allow_always":
+        # "Trust, always allow in this session" sits one row below the
+        # default one-time-allow focus (_wait_for_kiro_permission_prompt
+        # above already confirmed the prompt starts there), so a single Down
+        # lands on it.
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+        pane = _capture_pane(socket_path, tmux_target)
+        if not (
+            _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_always_allow(pane)
+        ):
+            raise RuntimeError(
+                "kiro-native trust-always option was not safely focused before delivery"
+            )
+        time.sleep(_PERMISSION_ENTER_SETTLE_S)
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
         return
