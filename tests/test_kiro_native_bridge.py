@@ -190,6 +190,54 @@ def test_send_kiro_permission_verdict_declines_with_slow_navigation(
     assert sent_keys == ["Down", "Down", "Enter"]
 
 
+def test_send_kiro_permission_verdict_delivers_allow_always(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE_TRUST_FOCUSED],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(bridge_dir, action="allow_always", timeout_s=0.1)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Down", "Enter"]
+
+
+def test_send_kiro_permission_verdict_refuses_allow_always_when_focus_stays_on_one_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane that doesn't advance focus after Down (e.g. a stuck TUI) must not fire Enter."""
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="trust-always option was not safely focused"):
+        send_kiro_permission_verdict(bridge_dir, action="allow_always", timeout_s=0.1)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Down"]
+
+
 def test_send_kiro_permission_verdict_requires_visible_permission_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

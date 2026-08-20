@@ -66,6 +66,7 @@ def test_parse_permission_request_extracts_one_time_options() -> None:
     assert req.title == "Running: pwd"
     assert req.accept_option_id == "allow_once"
     assert req.decline_option_id == "reject_once"
+    assert req.always_option_id == "allow_always"
     assert req.preview == "Running: pwd"
 
 
@@ -77,6 +78,18 @@ def test_parse_permission_request_preserves_option_ids_by_kind() -> None:
     assert req is not None
     assert req.accept_option_id == "yes-1"
     assert req.decline_option_id == "no-1"
+
+
+def test_parse_permission_request_leaves_always_option_none_when_absent() -> None:
+    msg = _permission_msg("req-1")
+    msg["params"]["options"] = [
+        opt for opt in msg["params"]["options"] if opt["kind"] != "allow_always"
+    ]
+
+    req = parse_permission_request(msg)
+
+    assert req is not None
+    assert req.always_option_id is None
 
 
 @pytest.mark.parametrize(
@@ -173,6 +186,11 @@ class _QueueClient:
         pytest.param(httpx.Response(200, json={"action": "accept"}), "accept", id="accept"),
         pytest.param(httpx.Response(200, json={"action": "decline"}), "decline", id="decline"),
         pytest.param(httpx.Response(200, json={"action": "cancel"}), "cancel", id="cancel"),
+        pytest.param(
+            httpx.Response(200, json={"action": "accept", "content": {"kiro_trust_always": True}}),
+            "allow_always",
+            id="accept-trust-always",
+        ),
         pytest.param(httpx.Response(200), None, id="empty-200"),
         pytest.param(httpx.Response(400, text="nope"), None, id="rejected"),
         pytest.param(httpx.Response(200, content=b"not-json"), None, id="non-json"),
@@ -187,14 +205,18 @@ async def test_run_one_permission_posts_then_delivers_verdict(
 ) -> None:
     delivered: list[tuple[Path, str]] = []
 
-    def _fake_send(bridge_dir: Path, *, action: str, expected_title: str | None = None) -> None:
-        assert expected_title == "Running: pwd"
+    def _fake_send(bridge_dir: Path, *, action: str) -> None:
         delivered.append((bridge_dir, action))
 
     monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
     req = parse_permission_request(_permission_msg("req-1"))
     assert req is not None
-    client = _QueueClient([response])
+    # A second queued response absorbs the "hook rejected" assistant-notice
+    # POST the >=400 branch fires — unused by every other parametrized case,
+    # which returns before that second POST would happen.
+    client = _QueueClient([response, httpx.Response(200)])
+    coordinator = knp._DeliveryCoordinator()
+    coordinator.register("req-1")
 
     await knp._run_one_permission(
         client,  # type: ignore[arg-type]
@@ -202,6 +224,7 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         bridge_dir=tmp_path,
         permission=req,
         elicitation_id="elic_1",
+        coordinator=coordinator,
     )
 
     url, body = client.posts[0]
@@ -213,11 +236,43 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         "operation_type": "tool",
         "message": "Kiro wants approval for Running: pwd",
         "content_preview": "Running: pwd",
+        "command": "Running: pwd",
+        # _permission_msg() always offers Kiro's "allow_always" option.
+        "kiro_trust_always": True,
     }
     if expected_action is None:
         assert delivered == []
     else:
         assert delivered == [(tmp_path, expected_action)]
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_omits_trust_always_hint_when_not_offered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", lambda *_a, **_kw: None)
+    msg = _permission_msg("req-1")
+    msg["params"]["options"] = [
+        opt for opt in msg["params"]["options"] if opt["kind"] != "allow_always"
+    ]
+    req = parse_permission_request(msg)
+    assert req is not None
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"})])
+    coordinator = knp._DeliveryCoordinator()
+    coordinator.register("req-1")
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        coordinator=coordinator,
+    )
+
+    _url, body = client.posts[0]
+    assert "kiro_trust_always" not in body
 
 
 @pytest.mark.asyncio

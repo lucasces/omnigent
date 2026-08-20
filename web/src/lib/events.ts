@@ -261,6 +261,17 @@ export interface ElicitationRequest {
    */
   allowAllEdits?: boolean;
   /**
+   * Producer-supplied extra (kiro-native permission prompts only): present
+   * when Kiro's live approval prompt also offers "Trust, always allow in
+   * this session" (in practice, every kiro-native prompt). The UI's
+   * ApprovalCard renders an "Approve & trust for this session" button that,
+   * on accept, tells the runner-side mirror to select Kiro's trust-always
+   * option in the TUI instead of the one-time allow.
+   *
+   * Absent/false for every other elicitation.
+   */
+  kiroTrustAlways?: boolean;
+  /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
    * supports a persistent "don't ask again" allow rule (everything
