@@ -18,7 +18,9 @@ from omnigent.harnesses.kiro_native.bridge import (
     acp_record_path,
     build_kiro_native_terminal_env,
     inject_user_message,
+    navigate_to_kiro_subagent_trust_scope,
     send_kiro_permission_verdict,
+    send_kiro_subagent_permission_verdict,
     write_forwarder_ready,
     write_tmux_target,
 )
@@ -55,6 +57,100 @@ _PERMISSION_PANE_NO_TRUST_OPTION_REJECT_FOCUSED = _PERMISSION_PANE_NO_TRUST_OPTI
     "❯ Yes, single permission\n   No (Tab to edit)",
     "  Yes, single permission\n ❯ No (Tab to edit)",
 )
+# Kiro V3 batches every pending subagent tool-call approval behind this
+# top-level picker instead of a modal prompt (see
+# _kiro_subagent_batch_prompt_active's docstring in kiro_native_bridge.py).
+_SUBAGENT_BATCH_PANE = """
+────────────────────────────────────────────────────────────────────────────────
+● Orchestrating (2 agents)
+  ● sleep2 kiro_default ⚠ tool approval needed
+  ● sleep1 kiro_default ⚠ tool approval needed
+────────────────────────────────────────────────────────────────────────────────
+ ⚠ 2 tool approvals pending from subagents
+ ❯ (a) Approve all pending
+   (f) Approve all pending and auto-approve all future requests
+   (c) Configure individually (agent monitor)
+   (x) Exit (cancel subagents)
+"""
+
+
+def _agent_monitor_pane(*, focused: str, rows: dict[str, str]) -> str:
+    """Build an AGENT MONITOR pane with *focused* subagent's own prompt shown.
+
+    ``rows`` maps subagent name -> its SUBAGENTS-list status text (e.g.
+    ``{"sleep1": "⚠ sleep1 Shell", "sleep2": "✓ sleep2 Completed"}``).
+    """
+    row_lines = "\n".join(f"  {i + 1} {text}" for i, text in enumerate(rows.values()))
+    return f"""
+ ⚠ The agent needs permission to run a tool │ press q or Esc to return to chat
+  AGENT MONITOR                                                 elapsed 0m 0s
+
+ SUBAGENTS  [/] ←→ select · 1-2 jump
+{row_lines}
+
+ SUBAGENT OUTPUT [{focused}] j/k scroll · ^d/^u page
+ ● {focused}
+  (kiro_default)
+
+──────────────────────────────────────────────────────────────────────────────
+◕ Shell sleep 5
+  esc to cancel
+ shell requires approval
+ ❯ Yes, single permission
+   Trust, always allow in this session
+   No
+
+ y approve · n deny · t trust
+──────────────────────────────────────────────────────────────────────────────
+ esc to close
+"""
+
+
+_AGENT_MONITOR_SLEEP1_FOCUSED = _agent_monitor_pane(
+    focused="sleep1", rows={"sleep1": "⚠ sleep1 Shell", "sleep2": "⚠ sleep2 Shell"}
+)
+_AGENT_MONITOR_SLEEP2_FOCUSED = _agent_monitor_pane(
+    focused="sleep2", rows={"sleep1": "✓ sleep1 Completed", "sleep2": "⚠ sleep2 Shell"}
+)
+# After a verdict lands, the focused subagent's own prompt is gone (no more
+# "requires approval" / "y approve" footer) — Kiro moved it on to running.
+_AGENT_MONITOR_SLEEP1_RESOLVED = """
+  AGENT MONITOR                                                 elapsed 0m 1s
+
+ SUBAGENTS  [/] ←→ select · 1-2 jump
+  1 ◑ sleep1 Shell (sleep 5)
+  2 ⚠ sleep2 Shell
+
+ SUBAGENT OUTPUT [sleep1] j/k scroll · ^d/^u page
+ ● Shell sleep 5
+  esc to cancel
+"""
+_AGENT_MONITOR_SLEEP2_RESOLVED = """
+  AGENT MONITOR                                                 elapsed 0m 1s
+
+ SUBAGENTS  [/] ←→ select · 1-2 jump
+  1 ✓ sleep1 Completed
+  2 ◑ sleep2 Shell (sleep 5)
+
+ SUBAGENT OUTPUT [sleep2] j/k scroll · ^d/^u page
+ ● Shell sleep 5
+  esc to cancel
+"""
+# Confirmed against a live kiro-cli V3 pane: the trust-scope submenu renders
+# with the same markers regardless of whether "t" was pressed from the
+# top-level prompt or from AGENT MONITOR.
+_AGENT_MONITOR_SLEEP2_TRUST_SCOPE = """
+  AGENT MONITOR                                                 elapsed 0m 1s
+
+ SUBAGENT OUTPUT [sleep2] j/k scroll · ^d/^u page
+◔ Shell sleep 5
+  esc to cancel
+ shell requires approval · trust options
+ ❯ Full command       sleep 5
+   Partial command    sleep 5 *
+   Base command       sleep *
+   Entire tool
+"""
 
 
 def _install_fake_tmux(
@@ -373,6 +469,183 @@ def test_send_kiro_permission_verdict_declines_on_two_row_menu_with_single_down(
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Down", "Enter"]
+
+
+def test_kiro_subagent_batch_prompt_active_detects_only_the_batched_picker() -> None:
+    assert bridge._kiro_subagent_batch_prompt_active(_SUBAGENT_BATCH_PANE)
+    assert not bridge._kiro_subagent_batch_prompt_active(_READY_PANE)
+    assert not bridge._kiro_subagent_batch_prompt_active(_PERMISSION_PANE)
+
+
+def test_kiro_agent_monitor_active_detects_only_the_monitor_view() -> None:
+    assert bridge._kiro_agent_monitor_active(_AGENT_MONITOR_SLEEP1_FOCUSED)
+    assert not bridge._kiro_agent_monitor_active(_SUBAGENT_BATCH_PANE)
+
+
+def test_kiro_agent_monitor_subagent_index_reads_the_jump_digit() -> None:
+    pane = _AGENT_MONITOR_SLEEP1_FOCUSED
+    assert bridge._kiro_agent_monitor_subagent_index(pane, "sleep1") == 1
+    assert bridge._kiro_agent_monitor_subagent_index(pane, "sleep2") == 2
+    assert bridge._kiro_agent_monitor_subagent_index(pane, "sleep9") is None
+
+
+def test_kiro_agent_monitor_subagent_focused_requires_own_header_and_prompt() -> None:
+    focused = _AGENT_MONITOR_SLEEP1_FOCUSED
+    assert bridge._kiro_agent_monitor_subagent_focused(focused, "sleep1")
+    assert not bridge._kiro_agent_monitor_subagent_focused(focused, "sleep2")
+    resolved = _AGENT_MONITOR_SLEEP1_RESOLVED
+    assert not bridge._kiro_agent_monitor_subagent_focused(resolved, "sleep1")
+
+
+def test_send_kiro_subagent_permission_verdict_accepts_already_focused_subagent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sleep1 is both the default AGENT MONITOR focus and our target — no jump digit needed."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _SUBAGENT_BATCH_PANE,
+            _AGENT_MONITOR_SLEEP1_FOCUSED,
+            _AGENT_MONITOR_SLEEP1_RESOLVED,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_subagent_permission_verdict(
+        bridge_dir, subagent_name="sleep1", action="accept", timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["c", "y"]
+
+
+def test_send_kiro_subagent_permission_verdict_declines_after_jumping_to_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sleep2 isn't the default focus, so delivery must jump to its row (digit "2") first."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _SUBAGENT_BATCH_PANE,
+            _AGENT_MONITOR_SLEEP1_FOCUSED,
+            _AGENT_MONITOR_SLEEP2_FOCUSED,
+            _AGENT_MONITOR_SLEEP2_RESOLVED,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_subagent_permission_verdict(
+        bridge_dir, subagent_name="sleep2", action="decline", timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["c", "2", "n"]
+
+
+def test_send_kiro_subagent_permission_verdict_skips_reopening_an_open_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second delivery in the same batch finds AGENT MONITOR already open — no "c" resend."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_AGENT_MONITOR_SLEEP2_FOCUSED, _AGENT_MONITOR_SLEEP2_RESOLVED],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_subagent_permission_verdict(
+        bridge_dir, subagent_name="sleep2", action="accept", timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["y"]
+
+
+def test_send_kiro_subagent_permission_verdict_raises_for_unknown_subagent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    _install_fake_tmux(
+        monkeypatch, pane_outputs=[_SUBAGENT_BATCH_PANE, _AGENT_MONITOR_SLEEP1_FOCUSED]
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    with pytest.raises(RuntimeError, match="no row for subagent"):
+        send_kiro_subagent_permission_verdict(
+            bridge_dir, subagent_name="sleep-missing", action="accept", timeout_s=0.1
+        )
+
+
+def test_navigate_to_kiro_subagent_trust_scope_resolves_directly_without_submenu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Some prompt kinds (observed: MCP tools) resolve on "t" with no trust-scope submenu."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _SUBAGENT_BATCH_PANE,
+            _AGENT_MONITOR_SLEEP1_FOCUSED,
+            _AGENT_MONITOR_SLEEP1_RESOLVED,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    rows = navigate_to_kiro_subagent_trust_scope(bridge_dir, subagent_name="sleep1", timeout_s=0.1)
+
+    assert rows == []
+
+
+def test_navigate_to_kiro_subagent_trust_scope_returns_submenu_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native shell prompt opens the same trust-scope submenu from inside AGENT MONITOR."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _SUBAGENT_BATCH_PANE,
+            _AGENT_MONITOR_SLEEP1_FOCUSED,
+            _AGENT_MONITOR_SLEEP2_FOCUSED,
+            _AGENT_MONITOR_SLEEP2_TRUST_SCOPE,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    rows = navigate_to_kiro_subagent_trust_scope(bridge_dir, subagent_name="sleep2", timeout_s=0.1)
+
+    assert rows == [
+        "Full command       sleep 5",
+        "Partial command    sleep 5 *",
+        "Base command       sleep *",
+        "Entire tool",
+    ]
 
 
 def test_inject_user_message_waits_for_forwarder_on_resumed_kiro_session(

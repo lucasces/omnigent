@@ -93,6 +93,48 @@ def test_parse_permission_request_leaves_always_option_none_when_absent() -> Non
     assert req.always_option_id is None
 
 
+def test_parse_permission_request_captures_subagent_session_id() -> None:
+    req = parse_permission_request(_permission_msg("req-1"))
+
+    assert req is not None
+    assert req.subagent_session_id == "kiro-session"
+
+
+def test_parse_permission_request_leaves_subagent_session_id_none_when_absent() -> None:
+    msg = _permission_msg("req-1")
+    del msg["params"]["sessionId"]
+
+    req = parse_permission_request(msg)
+
+    assert req is not None
+    assert req.subagent_session_id is None
+
+
+def test_parse_subagent_session_names_maps_session_id_to_name() -> None:
+    message = {
+        "jsonrpc": "2.0",
+        "method": "_kiro.dev/subagent/list_update",
+        "params": {
+            "subagents": [
+                {"sessionId": "sess-1", "sessionName": "sleep1"},
+                {"sessionId": "sess-2", "sessionName": "sleep2"},
+                {"sessionId": "", "sessionName": "no-id"},
+                {"sessionId": "sess-3"},
+                "not-a-dict",
+            ],
+            "pendingStages": [],
+        },
+    }
+
+    names = knp._parse_subagent_session_names(message)
+
+    assert names == {"sess-1": "sleep1", "sess-2": "sleep2"}
+
+
+def test_parse_subagent_session_names_ignores_other_methods() -> None:
+    assert knp._parse_subagent_session_names({"method": "session/prompt", "params": {}}) == {}
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -142,7 +184,7 @@ def test_read_new_permission_events_incremental_and_partial_line(tmp_path: Path)
     record_file = tmp_path / "kiro_acp_record.jsonl"
     record_file.write_bytes(_record_bytes(_permission_msg("req-1")))
 
-    events, offset = knp._read_new_permission_events(record_file, 0)
+    events, _names, offset = knp._read_new_permission_events(record_file, 0)
 
     assert [(event.kind, event.request_id) for event in events] == [("request", "req-1")]
 
@@ -150,10 +192,35 @@ def test_read_new_permission_events_incremental_and_partial_line(tmp_path: Path)
         handle.write(_record_bytes(_permission_result_msg("req-1"), direction="in"))
         handle.write(b'{"dir":"out","msg":"')
 
-    events2, offset2 = knp._read_new_permission_events(record_file, offset)
+    events2, _names2, offset2 = knp._read_new_permission_events(record_file, offset)
 
     assert [(event.kind, event.request_id) for event in events2] == [("response", "req-1")]
     assert offset2 == offset + len(_record_bytes(_permission_result_msg("req-1"), direction="in"))
+
+
+def test_read_new_permission_events_collects_subagent_name_updates(tmp_path: Path) -> None:
+    record_file = tmp_path / "kiro_acp_record.jsonl"
+    first_snapshot = {
+        "jsonrpc": "2.0",
+        "method": "_kiro.dev/subagent/list_update",
+        "params": {"subagents": [{"sessionId": "sess-1", "sessionName": "sleep1"}]},
+    }
+    second_snapshot = {
+        "jsonrpc": "2.0",
+        "method": "_kiro.dev/subagent/list_update",
+        "params": {
+            "subagents": [
+                {"sessionId": "sess-1", "sessionName": "sleep1"},
+                {"sessionId": "sess-2", "sessionName": "sleep2"},
+            ]
+        },
+    }
+    record_file.write_bytes(_record_bytes(first_snapshot) + _record_bytes(second_snapshot))
+
+    events, names, _offset = knp._read_new_permission_events(record_file, 0)
+
+    assert events == []
+    assert names == {"sess-1": "sleep1", "sess-2": "sleep2"}
 
 
 def test_read_new_permission_events_ignores_malformed_and_non_permission(tmp_path: Path) -> None:
@@ -164,7 +231,7 @@ def test_read_new_permission_events_ignores_malformed_and_non_permission(tmp_pat
         + _record_bytes(_permission_msg("req-1"))
     )
 
-    events, _offset = knp._read_new_permission_events(record_file, 0)
+    events, _names, _offset = knp._read_new_permission_events(record_file, 0)
 
     assert [(event.kind, event.request_id) for event in events] == [("request", "req-1")]
 
@@ -235,6 +302,7 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         permission=req,
         elicitation_id="elic_1",
         coordinator=coordinator,
+        subagent_names={},
     )
 
     url, body = client.posts[0]
@@ -290,7 +358,7 @@ async def test_resolve_kiro_trust_scope_index_matches_chosen_row() -> None:
 
 @pytest.mark.asyncio
 async def test_resolve_kiro_trust_scope_index_none_on_unmatched_answer() -> None:
-    """An answer that doesn't match any row (e.g. Kiro's submenu changed shape) resolves to None."""
+    """An answer matching no row (e.g. Kiro's submenu changed shape) resolves to None."""
     client = _QueueClient(
         [httpx.Response(200, json={"action": "accept", "content": {"answer": "not a row"}})]
     )
@@ -383,6 +451,128 @@ async def test_deliver_allow_always_raises_when_pick_unresolved(
 
 
 @pytest.mark.asyncio
+async def test_deliver_subagent_allow_always_resolves_trust_scope_pick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subagent counterpart of test_deliver_allow_always_resolves_trust_scope_pick."""
+    rows = ["Full command   sleep 5", "Entire tool"]
+    navigate_calls: list[tuple[Path, str]] = []
+    finish_calls: list[tuple[Path, int]] = []
+
+    def _fake_navigate(bridge_dir: Path, *, subagent_name: str, **_kw: object) -> list[str]:
+        navigate_calls.append((bridge_dir, subagent_name))
+        return rows
+
+    def _fake_finish(bridge_dir: Path, *, option_index: int, **_kw: object) -> None:
+        finish_calls.append((bridge_dir, option_index))
+
+    monkeypatch.setattr(knp, "navigate_to_kiro_subagent_trust_scope", _fake_navigate)
+    monkeypatch.setattr(knp, "send_kiro_trust_scope_verdict", _fake_finish)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient(
+        [httpx.Response(200, json={"action": "accept", "content": {"answer": rows[1]}})]
+    )
+
+    await knp._deliver_subagent_allow_always(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        subagent_name="sleep1",
+    )
+
+    assert navigate_calls == [(tmp_path, "sleep1")]
+    assert finish_calls == [(tmp_path, 1)]
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_routes_to_subagent_delivery_when_name_known(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sessionId that matches an announced subagent must use the AGENT MONITOR path.
+
+    Regression guard for the actual production bug: routing a subagent's
+    request through the classic single-prompt delivery
+    (send_kiro_permission_verdict) sends keystrokes at a prompt Kiro isn't
+    even showing (Kiro V3 batches these behind the picker instead — see
+    send_kiro_subagent_permission_verdict's docstring), so delivery always
+    times out.
+    """
+    subagent_delivered: list[tuple[Path, str, str]] = []
+    classic_delivered: list[tuple[Path, str]] = []
+
+    def _fake_subagent_send(
+        bridge_dir: Path, *, subagent_name: str, action: str, **_kw: object
+    ) -> None:
+        subagent_delivered.append((bridge_dir, subagent_name, action))
+
+    def _fake_classic_send(bridge_dir: Path, *, action: str, **_kw: object) -> None:
+        classic_delivered.append((bridge_dir, action))
+
+    monkeypatch.setattr(knp, "send_kiro_subagent_permission_verdict", _fake_subagent_send)
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_classic_send)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    assert req.subagent_session_id == "kiro-session"
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"})])
+    coordinator = knp._DeliveryCoordinator()
+    coordinator.register("req-1")
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        coordinator=coordinator,
+        subagent_names={"kiro-session": "sleep1"},
+    )
+
+    assert subagent_delivered == [(tmp_path, "sleep1", "accept")]
+    assert classic_delivered == []
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_routes_allow_always_to_subagent_delivery_when_name_known(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subagent_allow_always: list[Path] = []
+
+    async def _fake_deliver_subagent_allow_always(_client: object, **kwargs: object) -> None:
+        subagent_allow_always.append(kwargs["bridge_dir"])  # type: ignore[index]
+
+    async def _fake_deliver_allow_always(_client: object, **_kw: object) -> None:
+        raise AssertionError("classic _deliver_allow_always should not run for a subagent request")
+
+    monkeypatch.setattr(knp, "_deliver_subagent_allow_always", _fake_deliver_subagent_allow_always)
+    monkeypatch.setattr(knp, "_deliver_allow_always", _fake_deliver_allow_always)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient(
+        [httpx.Response(200, json={"action": "accept", "content": {"kiro_trust_always": True}})]
+    )
+    coordinator = knp._DeliveryCoordinator()
+    coordinator.register("req-1")
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        coordinator=coordinator,
+        subagent_names={"kiro-session": "sleep1"},
+    )
+
+    assert subagent_allow_always == [tmp_path]
+
+
+@pytest.mark.asyncio
 async def test_run_one_permission_omits_trust_always_hint_when_not_offered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -410,6 +600,7 @@ async def test_run_one_permission_omits_trust_always_hint_when_not_offered(
         permission=req,
         elicitation_id="elic_1",
         coordinator=coordinator,
+        subagent_names={},
     )
 
     _url, body = client.posts[0]
@@ -725,6 +916,82 @@ async def test_supervise_mirror_reaps_finished_task_and_mirrors_next_request(
                 break
             await asyncio.sleep(0.005)
         assert run_one_calls == ["req-1", "req-2"]
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_supervise_mirror_threads_subagent_names_into_run_one_permission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The poll loop must build subagent_names from list_update lines and pass it on.
+
+    Unit tests for _run_one_permission and _read_new_permission_events cover
+    their own logic in isolation, but neither proves supervise_kiro_permission_mirror
+    actually wires a "_kiro.dev/subagent/list_update" announcement through to
+    the delivery task for a request that arrives afterward in a later poll
+    tick — that accumulation (subagent_names.update(...) across ticks, then
+    passed into _run_one_permission) is this test's only subject.
+    """
+
+    class _FakeAsyncClient:
+        def __init__(self, **_kw: object) -> None:
+            pass
+
+        async def __aenter__(self) -> _FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(self, url: str, *, json: dict, **_kw: object) -> httpx.Response:
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(knp.httpx, "AsyncClient", _FakeAsyncClient)
+    seen_subagent_names: list[dict[str, str]] = []
+
+    async def _fake_run_one(
+        _client: object, *, subagent_names: dict[str, str], **_kw: object
+    ) -> None:
+        # Snapshot now — subagent_names is the loop's live mutable dict and
+        # keeps growing after this call returns.
+        seen_subagent_names.append(dict(subagent_names))
+
+    monkeypatch.setattr(knp, "_run_one_permission", _fake_run_one)
+    record_file = acp_record_path(tmp_path)
+    record_file.write_bytes(b"")
+
+    task = asyncio.create_task(
+        knp.supervise_kiro_permission_mirror(
+            base_url="http://t",
+            headers={},
+            session_id="conv_7",
+            bridge_dir=tmp_path,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        await asyncio.sleep(0.05)
+        # Kiro announces the subagent crew (sleep1's own ACP sessionId)
+        # before it ever asks for a tool-call permission.
+        list_update = {
+            "jsonrpc": "2.0",
+            "method": "_kiro.dev/subagent/list_update",
+            "params": {"subagents": [{"sessionId": "sess-1", "sessionName": "sleep1"}]},
+        }
+        subagent_request = _permission_msg("req-1")
+        subagent_request["params"]["sessionId"] = "sess-1"
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(list_update))
+            handle.write(_record_bytes(subagent_request))
+        for _ in range(400):
+            if seen_subagent_names:
+                break
+            await asyncio.sleep(0.005)
+        assert seen_subagent_names == [{"sess-1": "sleep1"}]
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
