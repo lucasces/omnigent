@@ -2512,6 +2512,160 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+async def test_events_compact_on_kiro_native_types_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a kiro-native session
+    types ``/compact`` into the live kiro TUI and returns 200.
+
+    kiro-cli owns its own context window in the terminal (there is no
+    ``llm.model``/``executor.model`` on the kiro-native pseudo-agent), so
+    explicit compaction must run inside kiro-cli itself — the same
+    rationale as claude/codex/hermes/qwen-native. Before this handler
+    existed, kiro-native fell through to the generic 204 no-op and the
+    Omnigent server's own ``_run_compact_locked`` 400ed with "/compact is
+    unavailable for this kiro-native session because the agent does not
+    declare an LLM model for server-side compaction" — the reported bug.
+
+    Mirrors ``test_events_compact_on_native_session_types_slash_command``.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+
+    def _fake_inject(bridge_dir: Any, *, content: str, timeout_s: float) -> None:
+        """Record the call and return without touching tmux."""
+        captured.append((bridge_dir, content, timeout_s))
+
+    monkeypatch.setattr(kiro_native_bridge, "inject_user_message", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the kiro-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    conv_id = "e5df6e10c85d4c9a9a6d1c9c3c9a4e11"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        # Drain kiro auto-create events so the drain below isolates only
+        # what /compact emits.
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        # /compact is a control signal and must not enqueue session.status events.
+        queue = _session_event_queues_ref.get(conv_id)
+        queued_events: list[dict[str, Any]] = []
+        if queue is not None:
+            while not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    queued_events.append(item)
+
+    # 200 = native dispatch routed to the kiro compact handler and it
+    # injected successfully. 204 would mean the dispatch fell through to
+    # the in-process no-op branch, and the Omnigent server would then
+    # 400 on _run_compact_locked (the original bug).
+    assert resp.status_code == 200, (
+        f"kiro-native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+    assert len(captured) == 1, (
+        f"Expected one inject_user_message call from kiro-native compact, got {len(captured)}."
+    )
+    bridge_dir, content, timeout_s = captured[0]
+    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id(conv_id)
+    assert content == "/compact", f"Expected '/compact' literal, got {content!r}."
+    assert timeout_s == 1.0
+    assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_kiro_native_returns_503_when_bridge_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Bridge-not-ready RuntimeError from the kiro-native injector surfaces as 503.
+
+    Sister to the happy-path test above. When the tmux pane isn't
+    attached there is no live kiro-cli to compact, so the handler
+    returns 503 with the ``kiro_native_compact_failed`` code — the
+    Omnigent server treats a non-200/204 runner response as an error
+    rather than silently falling through to its own (LLM-less, 400ing)
+    compaction.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(bridge_dir: Any, *, content: str, timeout_s: float) -> None:
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, content, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(kiro_native_bridge, "inject_user_message", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the kiro-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    conv_id = "d15f8b2b1b1a4e9a8b3c2d1e0f4a5b66"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+    assert resp.status_code == 503, (
+        f"kiro-native compact with inject failure must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "kiro_native_compact_failed", (
+        f"503 body must carry the bridge-failure error code; got {body!r}"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model_value",
     # Claude Code has no slash form for "use spawn default", so
