@@ -15,8 +15,10 @@ import httpx
 
 from omnigent.kiro_native_bridge import (
     acp_record_path,
+    navigate_to_kiro_subagent_trust_scope,
     navigate_to_kiro_trust_scope,
     send_kiro_permission_verdict,
+    send_kiro_subagent_permission_verdict,
     send_kiro_trust_scope_verdict,
 )
 
@@ -62,6 +64,16 @@ class KiroPermissionRequest:
     # that omits it for some prompt kinds degrades to the binary card instead
     # of dropping the whole request (see the accept/decline guard below).
     always_option_id: str | None = None
+    # Kiro's own per-subagent ACP session id (``params.sessionId``), present
+    # on every request but only meaningful for routing when it names a
+    # subagent Kiro has announced via ``_kiro.dev/subagent/list_update`` (see
+    # ``supervise_kiro_permission_mirror``'s ``subagent_names`` map). Kiro V3
+    # batches subagent-originated prompts behind a single top-level picker
+    # instead of showing them modally, so delivering these needs a different
+    # bridge path (``send_kiro_subagent_permission_verdict``) keyed by the
+    # subagent's display name rather than the plain Down/Enter navigation
+    # non-subagent prompts use.
+    subagent_session_id: str | None = None
 
     @property
     def preview(self) -> str:
@@ -210,6 +222,7 @@ def parse_permission_request(message: dict[str, object]) -> KiroPermissionReques
             always_option_id = option_id
     if not accept_option_id or not decline_option_id:
         return None
+    subagent_session_id = params.get("sessionId")
     return KiroPermissionRequest(
         request_id=request_id,
         tool_call_id=tool_call_id,
@@ -217,7 +230,47 @@ def parse_permission_request(message: dict[str, object]) -> KiroPermissionReques
         accept_option_id=accept_option_id,
         decline_option_id=decline_option_id,
         always_option_id=always_option_id,
+        subagent_session_id=(
+            subagent_session_id
+            if isinstance(subagent_session_id, str) and subagent_session_id
+            else None
+        ),
     )
+
+
+def _parse_subagent_session_names(message: dict[str, object]) -> dict[str, str]:
+    """Parse a Kiro ``_kiro.dev/subagent/list_update`` message's sessionId -> name map.
+
+    Kiro announces the live subagent crew (including each one's own ACP
+    ``sessionId``, matching what shows up in that subagent's
+    ``session/request_permission`` calls) via this notification, but never
+    includes a human-readable name in the permission request itself — this
+    is the only place ``sessionId`` gets tied to the display name
+    (``sessionName``, e.g. "sleep1") that AGENT MONITOR lists subagents
+    under, which delivery needs to pick the right row.
+    """
+    if message.get("method") != "_kiro.dev/subagent/list_update":
+        return {}
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return {}
+    subagents = params.get("subagents")
+    if not isinstance(subagents, list):
+        return {}
+    names: dict[str, str] = {}
+    for entry in subagents:
+        if not isinstance(entry, dict):
+            continue
+        session_id = entry.get("sessionId")
+        session_name = entry.get("sessionName")
+        if (
+            isinstance(session_id, str)
+            and session_id
+            and isinstance(session_name, str)
+            and session_name
+        ):
+            names[session_id] = session_name
+    return names
 
 
 def _permission_result_request_id(message: dict[str, object]) -> str | None:
@@ -250,28 +303,34 @@ def _decode_acp_message(record: object) -> dict[str, object] | None:
 
 def _read_new_permission_events(
     record_file: Path, offset: int
-) -> tuple[list[_PermissionEvent], int]:
-    """Read complete Kiro ACP recorder lines after *offset*."""
+) -> tuple[list[_PermissionEvent], dict[str, str], int]:
+    """Read complete Kiro ACP recorder lines after *offset*.
+
+    Also returns any subagent sessionId -> sessionName updates observed in
+    this batch of lines (see ``_parse_subagent_session_names``); empty if
+    none of the new lines were a subagent-list announcement.
+    """
     try:
         size = record_file.stat().st_size
     except OSError:
-        return [], offset
+        return [], {}, offset
     if size < offset:
         offset = 0
     if size == offset:
-        return [], offset
+        return [], {}, offset
     try:
         with record_file.open("rb") as handle:
             handle.seek(offset)
             data = handle.read(size - offset)
     except OSError:
-        return [], offset
+        return [], {}, offset
     last_nl = data.rfind(b"\n")
     if last_nl == -1:
-        return [], offset
+        return [], {}, offset
     consumed = data[: last_nl + 1]
     new_offset = offset + len(consumed)
     events: list[_PermissionEvent] = []
+    subagent_names: dict[str, str] = {}
     for raw in consumed.split(b"\n"):
         raw = raw.strip()
         if not raw:
@@ -290,7 +349,9 @@ def _read_new_permission_events(
         response_id = _permission_result_request_id(message)
         if response_id is not None:
             events.append(_PermissionEvent("response", response_id, None))
-    return events, new_offset
+            continue
+        subagent_names.update(_parse_subagent_session_names(message))
+    return events, subagent_names, new_offset
 
 
 async def supervise_kiro_permission_mirror(
@@ -310,15 +371,22 @@ async def supervise_kiro_permission_mirror(
         offset = 0
     pending: dict[str, _PendingPermission] = {}
     coordinator = _DeliveryCoordinator()
+    # Kiro sessionId -> display name (e.g. "sleep1"), built from
+    # ``_kiro.dev/subagent/list_update`` announcements. Only grows — a
+    # subagent's name never changes after it's first announced, so a
+    # request whose delivery is delayed (queued behind the coordinator)
+    # still resolves correctly against whatever name arrived by then.
+    subagent_names: dict[str, str] = {}
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
-                events, offset = await asyncio.to_thread(
+                events, name_updates, offset = await asyncio.to_thread(
                     _read_new_permission_events, record_file, offset
                 )
+                subagent_names.update(name_updates)
                 # Reap finished delivery tasks so a completed or failed web verdict
                 # frees that request's slot. Without this, a keystroke-delivery
                 # failure would leave the slot occupied forever and silently block
@@ -357,6 +425,7 @@ async def supervise_kiro_permission_mirror(
                                 permission=event.permission,
                                 elicitation_id=elicitation_id,
                                 coordinator=coordinator,
+                                subagent_names=subagent_names,
                             ),
                             name=f"kiro-permission-{event.request_id}",
                         )
@@ -478,6 +547,41 @@ async def _deliver_allow_always(
     await asyncio.to_thread(send_kiro_trust_scope_verdict, bridge_dir, option_index=chosen_index)
 
 
+async def _deliver_subagent_allow_always(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    permission: KiroPermissionRequest,
+    elicitation_id: str,
+    subagent_name: str,
+) -> None:
+    """Subagent counterpart of ``_deliver_allow_always`` (see its docstring).
+
+    :raises RuntimeError: propagated from the bridge if the tmux delivery
+        itself fails (caller's ``except RuntimeError`` handles the notice).
+    """
+    rows = await asyncio.to_thread(
+        navigate_to_kiro_subagent_trust_scope, bridge_dir, subagent_name=subagent_name
+    )
+    if not rows:
+        # No submenu appeared — this prompt kind resolved directly on
+        # "Trust, always allow", nothing more to do.
+        return
+    chosen_index = await _resolve_kiro_trust_scope_index(
+        client,
+        session_id=session_id,
+        permission=permission,
+        elicitation_id=elicitation_id,
+        rows=rows,
+    )
+    if chosen_index is None:
+        raise RuntimeError(
+            f"kiro-native trust-scope pick for {permission.request_id} was not resolved"
+        )
+    await asyncio.to_thread(send_kiro_trust_scope_verdict, bridge_dir, option_index=chosen_index)
+
+
 async def _run_one_permission(
     client: httpx.AsyncClient,
     *,
@@ -486,6 +590,7 @@ async def _run_one_permission(
     permission: KiroPermissionRequest,
     elicitation_id: str,
     coordinator: _DeliveryCoordinator,
+    subagent_names: dict[str, str],
 ) -> None:
     """Park one Kiro permission request on the server and deliver the verdict.
 
@@ -605,8 +710,36 @@ async def _run_one_permission(
         # a time, and it's always this one's turn only once every older
         # request has been confirmed resolved (see _DeliveryCoordinator).
         await coordinator.wait_turn(permission.request_id)
+        # A sessionId that names an announced subagent means Kiro is showing
+        # this prompt behind the batched picker (see
+        # send_kiro_subagent_permission_verdict's docstring), not the plain
+        # modal prompt — a request whose sessionId hasn't been announced yet
+        # (or has none) falls back to the classic single-prompt delivery,
+        # same as before.
+        subagent_name = (
+            subagent_names.get(permission.subagent_session_id)
+            if permission.subagent_session_id
+            else None
+        )
         try:
-            if deliver_action == "allow_always":
+            if subagent_name is not None:
+                if deliver_action == "allow_always":
+                    await _deliver_subagent_allow_always(
+                        client,
+                        session_id=session_id,
+                        bridge_dir=bridge_dir,
+                        permission=permission,
+                        elicitation_id=elicitation_id,
+                        subagent_name=subagent_name,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        send_kiro_subagent_permission_verdict,
+                        bridge_dir,
+                        subagent_name=subagent_name,
+                        action=deliver_action,
+                    )
+            elif deliver_action == "allow_always":
                 await _deliver_allow_always(
                     client,
                     session_id=session_id,

@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -503,6 +504,127 @@ def _kiro_permission_focus_on_reject(pane: str) -> bool:
     return any(line.strip().startswith("❯ No (Tab to edit)") for line in pane.splitlines())
 
 
+# Kiro V3 batches every pending subagent tool-call approval behind one
+# top-level picker ("N tool approvals pending from subagents", options
+# (a)/(f)/(c)/(x)) instead of showing each one modally like a non-subagent
+# prompt (see _kiro_permission_prompt_active, which never matches this
+# picker — none of its markers appear on it). "(c) Configure individually"
+# opens AGENT MONITOR, a per-subagent view where each pending prompt is
+# answered with its own "y approve · n deny · t trust" shortcuts instead of
+# the top-level Down/Enter picker navigation.
+_KIRO_SUBAGENT_BATCH_MARKER = "tool approvals pending from subagents"
+_KIRO_AGENT_MONITOR_MARKER = "AGENT MONITOR"
+_KIRO_SUBAGENT_OUTPUT_HEADER_PREFIX = "SUBAGENT OUTPUT ["
+# Matches an AGENT MONITOR subagent row, e.g. "  1 ⚠ sleep1 Shell" or
+# "  2 ✓ sleep2 Completed" — group 1 is the 1-based jump digit, group 2 is
+# the subagent's name (the token right after the status glyph).
+_KIRO_AGENT_MONITOR_ROW_RE = re.compile(r"^\s*(\d+)\s+\S+\s+(\S+)")
+
+
+def _kiro_subagent_batch_prompt_active(pane: str) -> bool:
+    """Return whether Kiro's batched subagent-approval picker is showing."""
+    return _KIRO_SUBAGENT_BATCH_MARKER in pane
+
+
+def _kiro_agent_monitor_active(pane: str) -> bool:
+    """Return whether Kiro's per-subagent AGENT MONITOR view is open."""
+    return _KIRO_AGENT_MONITOR_MARKER in pane
+
+
+def _kiro_agent_monitor_subagent_focused(pane: str, subagent_name: str) -> bool:
+    """Return whether AGENT MONITOR is showing *subagent_name*'s own pending prompt."""
+    header = f"{_KIRO_SUBAGENT_OUTPUT_HEADER_PREFIX}{subagent_name}]"
+    if header not in pane:
+        return False
+    return "requires approval" in pane and "y approve" in pane
+
+
+def _kiro_agent_monitor_subagent_index(pane: str, subagent_name: str) -> int | None:
+    """Return the 1-based row number AGENT MONITOR lists *subagent_name* under."""
+    for line in pane.splitlines():
+        match = _KIRO_AGENT_MONITOR_ROW_RE.match(line)
+        if match and match.group(2) == subagent_name:
+            return int(match.group(1))
+    return None
+
+
+def _focus_kiro_subagent_prompt(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    subagent_name: str,
+    timeout_s: float,
+) -> str:
+    """Navigate into AGENT MONITOR and focus *subagent_name*'s own pending prompt.
+
+    Drills through the batched picker's "(c) Configure individually" option
+    (single-key shortcut, no Down-navigation needed) into AGENT MONITOR, then
+    jumps to *subagent_name*'s row via its 1-based jump digit — the only way
+    to answer one specific subagent's request without also resolving every
+    other pending one via the top-level "(a) Approve all pending" (which was
+    the previous behavior and would have delivered a verdict no human
+    actually gave to whichever other request happened to be pending too).
+
+    :raises RuntimeError: if neither the batch picker nor AGENT MONITOR ever
+        appears, if AGENT MONITOR never opens after "c", if *subagent_name*
+        has no row in AGENT MONITOR (Kiro hasn't listed it yet), or if its
+        row never becomes focused after jumping to it.
+    """
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=lambda _p: True,
+        timeout_s=timeout_s,
+        prompt_active_check=lambda p: (
+            _kiro_agent_monitor_active(p) or _kiro_subagent_batch_prompt_active(p)
+        ),
+    )
+    if not (_kiro_agent_monitor_active(pane) or _kiro_subagent_batch_prompt_active(pane)):
+        raise RuntimeError(
+            "kiro-native subagent approval prompt was not visible before verdict delivery"
+        )
+    if not _kiro_agent_monitor_active(pane):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "c")
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+        pane = _wait_for_focus(
+            socket_path,
+            tmux_target,
+            focus_check=lambda _p: True,
+            timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+            prompt_active_check=_kiro_agent_monitor_active,
+        )
+        if not _kiro_agent_monitor_active(pane):
+            raise RuntimeError("kiro-native agent monitor did not open before verdict delivery")
+    if _kiro_agent_monitor_subagent_focused(pane, subagent_name):
+        return pane
+    index = _kiro_agent_monitor_subagent_index(pane, subagent_name)
+    if index is None:
+        raise RuntimeError(f"kiro-native agent monitor has no row for subagent {subagent_name!r}")
+    if index > 9:
+        # Observed jump shortcuts are single digits ("1-2 jump" for a 2-agent
+        # batch); a 10th+ subagent has no known single-keystroke jump and
+        # sending "10" would send two separate keystrokes ('1' then '0'),
+        # each jumping to a different (wrong) row instead of one action.
+        raise RuntimeError(
+            "kiro-native agent monitor jump shortcuts beyond 9 subagents are unsupported "
+            f"(subagent {subagent_name!r} is row {index})"
+        )
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, str(index))
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=lambda p: _kiro_agent_monitor_subagent_focused(p, subagent_name),
+        timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+        prompt_active_check=_kiro_agent_monitor_active,
+    )
+    if not _kiro_agent_monitor_subagent_focused(pane, subagent_name):
+        raise RuntimeError(
+            f"kiro-native subagent {subagent_name!r} prompt was not focused before delivery"
+        )
+    return pane
+
+
 # Selecting "Trust, always allow in this session" doesn't complete the
 # verdict by itself on prompt kinds that support scoped trust (observed:
 # shell) — Kiro opens a second, local-only submenu asking exactly what to
@@ -913,6 +1035,114 @@ def send_kiro_permission_verdict(
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     time.sleep(_PERMISSION_KEY_INTERVAL_S)
+
+
+def send_kiro_subagent_permission_verdict(
+    bridge_dir: Path,
+    *,
+    subagent_name: str,
+    action: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Deliver a one-time accept/decline verdict to *subagent_name*'s own prompt.
+
+    Subagent counterpart of ``send_kiro_permission_verdict``: Kiro V3 batches
+    every pending subagent tool-call approval behind one top-level picker
+    rather than showing each modally (see ``_focus_kiro_subagent_prompt``),
+    so answering one specific subagent's request means drilling into AGENT
+    MONITOR and selecting its row first, then using its dedicated "y"/"n"
+    shortcuts instead of the top-level Down/Enter picker navigation.
+
+    ``action`` must be "accept", "decline", or "cancel" — for "allow_always"
+    use :func:`navigate_to_kiro_subagent_trust_scope` instead, since that
+    verdict may open a further trust-scope submenu this function doesn't
+    handle.
+
+    :raises RuntimeError: if the tmux target is stale, the TUI has exited,
+        *subagent_name*'s prompt is never reached (see
+        ``_focus_kiro_subagent_prompt``), or the prompt is still showing
+        after the keystroke (delivery not confirmed).
+    """
+    if action not in {"accept", "decline", "cancel"}:
+        raise RuntimeError(f"unsupported kiro subagent permission action: {action!r}")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "kiro terminal is no longer running (the TUI exited); restart the session"
+        )
+    _focus_kiro_subagent_prompt(
+        socket_path, tmux_target, subagent_name=subagent_name, timeout_s=timeout_s
+    )
+    key = "y" if action == "accept" else "n"
+    time.sleep(_PERMISSION_ENTER_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=lambda p: not _kiro_agent_monitor_subagent_focused(p, subagent_name),
+        timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+        prompt_active_check=lambda _p: True,
+    )
+    if _kiro_agent_monitor_subagent_focused(pane, subagent_name):
+        raise RuntimeError(
+            f"kiro-native subagent {subagent_name!r} verdict delivery was not confirmed"
+        )
+
+
+def navigate_to_kiro_subagent_trust_scope(
+    bridge_dir: Path,
+    *,
+    subagent_name: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> list[str]:
+    """Select "Trust, always allow" for *subagent_name* and report any trust-scope submenu.
+
+    Subagent counterpart of ``navigate_to_kiro_trust_scope``: reaches
+    *subagent_name*'s own prompt in AGENT MONITOR first (see
+    ``_focus_kiro_subagent_prompt``), then uses its dedicated "t" trust
+    shortcut instead of the top-level Down-navigate-to-third-row dance.
+    Kiro's trust-scope submenu, once open, renders with the same markers
+    regardless of which prompt opened it (confirmed against a live subagent
+    prompt), so the resulting rows are finished the same way as the
+    top-level flow: via :func:`send_kiro_trust_scope_verdict`.
+
+    Returns an empty list if the prompt instead resolves directly with no
+    submenu — not every prompt kind offers scoped trust (observed: MCP
+    tools resolve directly; native shell commands open the submenu).
+
+    :raises RuntimeError: if *subagent_name*'s prompt is never reached, or if
+        neither the submenu nor prompt resolution is observed before
+        *timeout_s*.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "kiro terminal is no longer running (the TUI exited); restart the session"
+        )
+    _focus_kiro_subagent_prompt(
+        socket_path, tmux_target, subagent_name=subagent_name, timeout_s=timeout_s
+    )
+    time.sleep(_PERMISSION_ENTER_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "t")
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _kiro_trust_scope_active(pane):
+            return _kiro_trust_scope_rows(pane)
+        if not _kiro_agent_monitor_subagent_focused(pane, subagent_name):
+            # Resolved directly — this prompt kind has no trust-scope submenu.
+            return []
+        time.sleep(_POLL_INTERVAL_S)
+    raise RuntimeError(
+        "kiro-native subagent trust-scope submenu did not appear and the "
+        "prompt did not resolve after selecting trust-always"
+    )
 
 
 def navigate_to_kiro_trust_scope(
