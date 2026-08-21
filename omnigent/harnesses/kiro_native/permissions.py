@@ -32,6 +32,14 @@ _SUPPORTED_ALWAYS_OPTION = "allow_always"
 # blip silently; only a failure that survives all three is treated as real.
 _HOOK_POST_MAX_ATTEMPTS = 3
 _HOOK_POST_RETRY_DELAYS_S = (1.0, 3.0)
+# Fallback release for a coordinator slot whose keystroke delivery succeeded
+# but whose Kiro ACP "response" event (the normal release signal — see
+# _DeliveryCoordinator) never showed up in the recorder log (a dropped or
+# delayed log line, or Kiro exiting right after answering). Long enough that
+# it never fires for the ordinary case (the response event normally shows up
+# within one or two poll ticks), short enough that a genuinely lost event
+# doesn't wedge every later request behind it for long.
+_COORDINATOR_WATCHDOG_S = 15.0
 
 
 @dataclass(frozen=True)
@@ -126,6 +134,35 @@ def _consume_task_result(task: asyncio.Task[None]) -> None:
     """Retrieve task exceptions so cancelled loser tasks do not warn."""
     with contextlib.suppress(asyncio.CancelledError):
         task.exception()
+
+
+# Keeps a strong reference to in-flight watchdogs so the event loop can't
+# garbage-collect them mid-sleep (a bare ``asyncio.create_task`` result with
+# nothing holding it is only weakly referenced from the loop's perspective).
+_watchdog_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _release_coordinator_slot_after(
+    coordinator: _DeliveryCoordinator, request_id: str, delay_s: float
+) -> None:
+    """Fallback release if Kiro's ACP response event for *request_id* never arrives.
+
+    ``_DeliveryCoordinator.complete`` is idempotent (a missing id is a no-op,
+    see its ``suppress(ValueError)``), so this racing with the normal
+    response-event release in :func:`supervise_kiro_permission_mirror` is safe
+    either order.
+    """
+    await asyncio.sleep(delay_s)
+    await coordinator.complete(request_id)
+
+
+def _spawn_coordinator_watchdog(coordinator: _DeliveryCoordinator, request_id: str) -> None:
+    task = asyncio.create_task(
+        _release_coordinator_slot_after(coordinator, request_id, _COORDINATOR_WATCHDOG_S),
+        name=f"kiro-permission-watchdog-{request_id}",
+    )
+    _watchdog_tasks.add(task)
+    task.add_done_callback(_watchdog_tasks.discard)
 
 
 def parse_permission_request(message: dict[str, object]) -> KiroPermissionRequest | None:
@@ -355,18 +392,30 @@ async def _run_one_permission(
 ) -> None:
     """Park one Kiro permission request on the server and deliver the verdict.
 
-    Every exit path — early return on a hook-POST error, or the delivery
-    attempt itself failing/succeeding — must free this request's coordinator
-    slot exactly once. The normal completion signal is the ACP "response"
-    event handled in the main poll loop, but that event only fires once
-    Kiro's prompt is actually answered; any early return here (POST failed,
-    non-2xx, non-JSON body, no usable action) leaves that prompt never
-    reached, so nothing will ever generate that event for this request.
-    Wrapping the whole body in try/finally guarantees the coordinator's
-    queue always advances, instead of deadlocking every later request behind
-    a slot nothing will ever release (observed in production: one dropped
-    hook response was enough to silently stall every subsequent approval).
+    Every exit path must free this request's coordinator slot exactly once,
+    but *when* it does so matters:
+
+    - Any early return before delivery is attempted (POST failed, non-2xx,
+      non-JSON body, no usable action) leaves Kiro's prompt never reached, so
+      nothing will ever generate an ACP "response" event for this request —
+      the ``finally`` below releases the slot immediately in that case, via
+      ``delivered_ok`` staying ``False``.
+    - Once ``send_kiro_permission_verdict`` actually returns successfully,
+      the slot must instead wait for Kiro's own ACP "response" event (handled
+      in the main poll loop) before releasing — that event is the only
+      reliable signal the visible prompt actually moved on (see
+      ``_DeliveryCoordinator``). Releasing immediately on keystroke-send
+      *return* instead of on Kiro's confirmed *response* used to let the next
+      queued request touch the pane before Kiro repainted it past the prompt
+      we just answered, landing its own delivery on our still-visible prompt
+      instead of its own (silently misdirected approvals, no card ever shown
+      for the misdirected request). A watchdog (``_spawn_coordinator_watchdog``)
+      still releases the slot on a delay as a safety net in case that response
+      event is ever dropped — matching the original defense this function's
+      unconditional ``finally`` was written for, without paying for it on
+      every successful delivery.
     """
+    delivered_ok = False
     try:
         payload: dict[str, Any] = {
             "elicitation_id": elicitation_id,
@@ -464,7 +513,9 @@ async def _run_one_permission(
                 send_kiro_permission_verdict,
                 bridge_dir,
                 action=deliver_action,
+                has_trust_always_option=permission.always_option_id is not None,
             )
+            delivered_ok = True
         except RuntimeError:
             _logger.exception(
                 "failed to deliver kiro permission verdict for %s; session=%s",
@@ -486,7 +537,13 @@ async def _run_one_permission(
                 ),
             )
     finally:
-        await coordinator.complete(permission.request_id)
+        if delivered_ok:
+            # Kiro's own ACP "response" event is the real release signal
+            # (see _DeliveryCoordinator and the docstring above) — the
+            # watchdog is only a fallback in case that event is dropped.
+            _spawn_coordinator_watchdog(coordinator, permission.request_id)
+        else:
+            await coordinator.complete(permission.request_id)
 
 
 async def _post_hook_with_retry(
