@@ -206,7 +206,7 @@ async def test_run_one_permission_posts_then_delivers_verdict(
 ) -> None:
     delivered: list[tuple[Path, str]] = []
 
-    def _fake_send(bridge_dir: Path, *, action: str) -> None:
+    def _fake_send(bridge_dir: Path, *, action: str, **_kw: object) -> None:
         delivered.append((bridge_dir, action))
 
     monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
@@ -252,7 +252,12 @@ async def test_run_one_permission_omits_trust_always_hint_when_not_offered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(knp, "send_kiro_permission_verdict", lambda *_a, **_kw: None)
+    delivered_kwargs: dict[str, object] = {}
+
+    def _fake_send(bridge_dir: Path, *, action: str, **kwargs: object) -> None:
+        delivered_kwargs.update(kwargs)
+
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
     msg = _permission_msg("req-1")
     msg["params"]["options"] = [
         opt for opt in msg["params"]["options"] if opt["kind"] != "allow_always"
@@ -274,6 +279,10 @@ async def test_run_one_permission_omits_trust_always_hint_when_not_offered(
 
     _url, body = client.posts[0]
     assert "kiro_trust_always" not in body
+    # A prompt that never offered "Trust, always allow" is a 2-row menu, so
+    # decline/cancel delivery must send one Down instead of two — see
+    # send_kiro_permission_verdict's has_trust_always_option.
+    assert delivered_kwargs.get("has_trust_always_option") is False
 
 
 @pytest.mark.asyncio
@@ -436,7 +445,9 @@ async def test_supervise_mirror_serializes_keystroke_delivery_via_coordinator(
     (rather than mocking it away, which would bypass the coordinator
     entirely) and blocks the first request's ``send_kiro_permission_verdict``
     call to prove the second request's call cannot start until the first
-    one's keystroke delivery finishes and releases the coordinator slot.
+    one's keystroke delivery finishes *and* Kiro's ACP "response" event for
+    it is observed — release now waits for that event rather than firing the
+    instant the mocked call returns, so ``_fake_send`` simulates it.
     """
 
     class _FakeAsyncClient:
@@ -459,8 +470,10 @@ async def test_supervise_mirror_serializes_keystroke_delivery_via_coordinator(
     delivery_order: list[int] = []
     first_call_blocking = threading.Event()
     release_first = threading.Event()
+    record_file = acp_record_path(tmp_path)
+    record_file.write_bytes(b"")
 
-    def _fake_send(bridge_dir: Path, *, action: str) -> None:
+    def _fake_send(bridge_dir: Path, *, action: str, **_kw: object) -> None:
         # Runs off the event loop thread (via asyncio.to_thread), so blocking
         # here does not stall req-2's task from reaching its own
         # coordinator.wait_turn() — only from getting PAST it.
@@ -469,10 +482,15 @@ async def test_supervise_mirror_serializes_keystroke_delivery_via_coordinator(
         if index == 0:
             first_call_blocking.set()
             assert release_first.wait(timeout=2.0), "test never released the first delivery"
+            # The coordinator slot is now only released by Kiro's own ACP
+            # "response" event (see _run_one_permission's finally), not by
+            # this call simply returning — so simulate the TUI confirming
+            # req-1 was answered, same as the real kiro_session_forwarder
+            # would append to this file once Kiro repaints past the prompt.
+            with record_file.open("ab") as handle:
+                handle.write(_record_bytes(_permission_result_msg("req-1"), direction="in"))
 
     monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
-    record_file = acp_record_path(tmp_path)
-    record_file.write_bytes(b"")
 
     task = asyncio.create_task(
         knp.supervise_kiro_permission_mirror(

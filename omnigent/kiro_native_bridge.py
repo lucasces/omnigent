@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TypedDict
 
@@ -57,16 +58,26 @@ _SUBMIT_VERIFY_TIMEOUT_S = 5.0
 _SUBMIT_RETRY_INTERVAL_S = 0.5
 _PERMISSION_KEY_INTERVAL_S = 0.3
 _PERMISSION_ENTER_SETTLE_S = 0.5
+# How long to keep re-capturing the pane for a focus check to settle before
+# giving up on a permission verdict (see ``_wait_for_focus``). Short relative
+# to ``_TMUX_READY_TIMEOUT_S`` because this only needs to absorb a tmux
+# redraw race, not wait out a genuinely wedged TUI.
+_PERMISSION_FOCUS_RETRY_TIMEOUT_S = 5.0
 _KIRO_SEPARATOR = "────"
 _KIRO_INPUT_READY_MARKERS = (
     "ask a question or describe a task",
     "Type to steer",
 )
 _PASTE_BUFFER = "omnigent-kiro-paste"
+# "Trust, always allow in this session" is deliberately excluded: Kiro omits
+# it for some prompt kinds (KiroPermissionRequest.always_option_id can be
+# None, a 2-row menu), and requiring it here meant _kiro_permission_prompt_active
+# could never recognize such a prompt as active at all — every accept/decline
+# delivery attempt against a 2-row prompt timed out in
+# _wait_for_kiro_permission_prompt before ever sending a keystroke.
 _KIRO_PERMISSION_MARKERS = (
     "requires approval",
     "Yes, single permission",
-    "Trust, always allow in this session",
     "No (Tab to edit)",
 )
 
@@ -522,6 +533,36 @@ def _wait_for_kiro_permission_prompt(
     )
 
 
+def _wait_for_focus(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    focus_check: Callable[[str], bool],
+    timeout_s: float,
+) -> str:
+    """Poll the pane until ``focus_check`` holds; return the last captured pane.
+
+    Every navigation step below (``Down`` then re-check) used to re-capture
+    the pane exactly once and give up permanently if that single capture
+    didn't show the expected row focused — a plain tmux redraw race (the
+    pane captured mid-repaint, before Kiro finished drawing the cursor on
+    its new row) was enough to abandon delivery for good, leaving the verdict
+    the human already gave stuck forever with no further attempt (see
+    ``send_kiro_permission_verdict``). This mirrors the retry loop
+    ``_wait_for_kiro_permission_prompt`` already uses to wait for the prompt
+    to first appear, applied to each individual focus check instead of just
+    the initial one.
+    """
+    deadline = time.monotonic() + timeout_s
+    pane = ""
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _kiro_permission_prompt_active(pane) and focus_check(pane):
+            return pane
+        time.sleep(_POLL_INTERVAL_S)
+    return pane
+
+
 def _wait_for_kiro_input_ready(
     socket_path: str,
     tmux_target: str,
@@ -710,9 +751,18 @@ def send_kiro_permission_verdict(
     bridge_dir: Path,
     *,
     action: str,
+    has_trust_always_option: bool = True,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
-    """Deliver a one-time or trust-always Kiro permission verdict to the active TUI prompt."""
+    """Deliver a one-time or trust-always Kiro permission verdict to the active TUI prompt.
+
+    ``has_trust_always_option`` must reflect whether *this specific* prompt
+    offered "Trust, always allow in this session" (i.e.
+    ``KiroPermissionRequest.always_option_id is not None``) — it controls how
+    many rows "No" sits below the default focus for ``decline``/``cancel``.
+    Defaults to ``True`` (the historical, 3-row assumption) for callers that
+    don't track this.
+    """
     if action not in {"accept", "decline", "cancel", "allow_always"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
@@ -725,7 +775,12 @@ def send_kiro_permission_verdict(
     _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
     if action == "accept":
         time.sleep(_PERMISSION_ENTER_SETTLE_S)
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = _wait_for_focus(
+            socket_path,
+            tmux_target,
+            focus_check=_kiro_permission_focus_on_one_time_allow,
+            timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+        )
         if not (
             _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(pane)
         ):
@@ -740,7 +795,12 @@ def send_kiro_permission_verdict(
         # lands on it.
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = _wait_for_focus(
+            socket_path,
+            tmux_target,
+            focus_check=_kiro_permission_focus_on_always_allow,
+            timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+        )
         if not (
             _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_always_allow(pane)
         ):
@@ -751,10 +811,22 @@ def send_kiro_permission_verdict(
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
         return
-    for key in ("Down", "Down"):
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
+    # decline / cancel: "No" sits one row below the default one-time-allow
+    # focus when Kiro also offered "Trust, always allow" (3-row menu), or
+    # directly below it otherwise (2-row menu — see ``has_trust_always_option``).
+    # Sending a fixed two Downs regardless used to overshoot "No" on a 2-row
+    # menu and land back on nothing recognizable, permanently abandoning the
+    # decline instead of just landing correctly.
+    down_presses = 2 if has_trust_always_option else 1
+    for _ in range(down_presses):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
-    pane = _capture_pane(socket_path, tmux_target)
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=_kiro_permission_focus_on_reject,
+        timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+    )
     if not (_kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_reject(pane)):
         raise RuntimeError("kiro-native reject option was not safely focused before delivery")
     time.sleep(_PERMISSION_ENTER_SETTLE_S)

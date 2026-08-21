@@ -45,6 +45,16 @@ _PERMISSION_PANE_REJECT_FOCUSED = _PERMISSION_PANE.replace(
     "❯ Yes, single permission\n   Trust, always allow in this session\n   No (Tab to edit)",
     "  Yes, single permission\n   Trust, always allow in this session\n ❯ No (Tab to edit)",
 )
+# Kiro omits "Trust, always allow" for some prompt kinds (see
+# KiroPermissionRequest.always_option_id) — a 2-row menu instead of 3.
+_PERMISSION_PANE_NO_TRUST_OPTION = _PERMISSION_PANE.replace(
+    "❯ Yes, single permission\n   Trust, always allow in this session\n   No (Tab to edit)",
+    "❯ Yes, single permission\n   No (Tab to edit)",
+)
+_PERMISSION_PANE_NO_TRUST_OPTION_REJECT_FOCUSED = _PERMISSION_PANE_NO_TRUST_OPTION.replace(
+    "❯ Yes, single permission\n   No (Tab to edit)",
+    "  Yes, single permission\n ❯ No (Tab to edit)",
+)
 
 
 def _install_fake_tmux(
@@ -139,6 +149,7 @@ def test_send_kiro_permission_verdict_refuses_accept_when_focus_drifts_after_set
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_FOCUS_RETRY_TIMEOUT_S", 0.01)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(
         monkeypatch,
@@ -155,6 +166,41 @@ def test_send_kiro_permission_verdict_refuses_accept_when_focus_drifts_after_set
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == []
+
+
+def test_send_kiro_permission_verdict_recovers_from_transient_bad_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single mistimed pane capture must not abandon delivery for good.
+
+    Regression test: before ``_wait_for_focus``, the accept branch captured
+    the pane exactly once after the settle delay and gave up permanently if
+    that one capture didn't show the allow row focused. A plain tmux redraw
+    race (the pane read mid-repaint) was enough to trip this and leave the
+    verdict undelivered forever — see ``_wait_for_focus``'s docstring. Here
+    the second capture is transiently wrong (simulating that race) but the
+    third recovers; delivery must still succeed instead of raising.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_FOCUS_RETRY_TIMEOUT_S", 1.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE_TRUST_FOCUSED, _PERMISSION_PANE],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(bridge_dir, action="accept", timeout_s=0.1)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Enter"]
 
 
 def test_send_kiro_permission_verdict_declines_with_slow_navigation(
@@ -213,6 +259,7 @@ def test_send_kiro_permission_verdict_refuses_allow_always_when_focus_stays_on_o
     """A pane that doesn't advance focus after Down (e.g. a stuck TUI) must not fire Enter."""
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_FOCUS_RETRY_TIMEOUT_S", 0.01)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(
         monkeypatch,
@@ -272,6 +319,7 @@ def test_send_kiro_permission_verdict_refuses_decline_when_reject_not_focused(
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_FOCUS_RETRY_TIMEOUT_S", 0.01)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(
         monkeypatch,
@@ -288,6 +336,43 @@ def test_send_kiro_permission_verdict_refuses_decline_when_reject_not_focused(
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Down", "Down"]
+
+
+def test_send_kiro_permission_verdict_declines_on_two_row_menu_with_single_down(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt without "Trust, always allow" has "No" one row below Yes, not two.
+
+    Regression test: ``decline``/``cancel`` used to unconditionally send two
+    Downs, which overshoots "No" on a 2-row menu (no ``always_option_id`` —
+    see ``KiroPermissionRequest``) and abandons delivery instead of landing
+    correctly.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_FOCUS_RETRY_TIMEOUT_S", 0.01)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_NO_TRUST_OPTION,
+            _PERMISSION_PANE_NO_TRUST_OPTION_REJECT_FOCUSED,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir, action="decline", has_trust_always_option=False, timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Down", "Enter"]
 
 
 def test_inject_user_message_waits_for_forwarder_on_resumed_kiro_session(
