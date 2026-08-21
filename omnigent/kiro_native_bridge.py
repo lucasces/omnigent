@@ -503,6 +503,81 @@ def _kiro_permission_focus_on_reject(pane: str) -> bool:
     return any(line.strip().startswith("❯ No (Tab to edit)") for line in pane.splitlines())
 
 
+# Selecting "Trust, always allow in this session" doesn't complete the
+# verdict by itself on prompt kinds that support scoped trust (observed:
+# shell) — Kiro opens a second, local-only submenu asking exactly what to
+# trust (e.g. "Full command" / "Partial command" / "Base command" / "Entire
+# tool" for a shell prompt). Both markers sit together on the submenu's own
+# header line ("shell requires approval · trust options"), distinguishing it
+# from the top-level prompt's plain "shell requires approval" header.
+_KIRO_TRUST_SCOPE_HEADER_MARKERS = ("requires approval", "trust options")
+
+
+def _kiro_trust_scope_active(pane: str) -> bool:
+    """Return whether Kiro's trust-scope submenu (post "Trust, always allow") is active."""
+    return any(
+        all(marker in line for marker in _KIRO_TRUST_SCOPE_HEADER_MARKERS)
+        for line in pane.splitlines()
+    )
+
+
+def _kiro_trust_scope_header_index(pane_lines: list[str]) -> int | None:
+    """Return the index of the trust-scope submenu's header line, if present."""
+    return next(
+        (
+            i
+            for i, line in enumerate(pane_lines)
+            if all(marker in line for marker in _KIRO_TRUST_SCOPE_HEADER_MARKERS)
+        ),
+        None,
+    )
+
+
+def _kiro_trust_scope_rows(pane: str) -> list[str]:
+    """Return the trust-scope submenu's option rows, cursor glyph stripped, in on-screen order.
+
+    Captured verbatim from the live pane rather than reconstructed, so a
+    caller mirrors exactly what Kiro itself is showing right now — including
+    per-prompt dynamic text (e.g. "Partial command   sleep 5 *") — without
+    this bridge needing to understand how Kiro derives partial/base command
+    patterns.
+    """
+    lines = pane.splitlines()
+    header_idx = _kiro_trust_scope_header_index(lines)
+    if header_idx is None:
+        return []
+    rows: list[str] = []
+    for line in lines[header_idx + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            if rows:
+                break
+            continue
+        if _KIRO_SEPARATOR in stripped or stripped.startswith("esc "):
+            break
+        rows.append(stripped.removeprefix("❯").strip())
+    return rows
+
+
+def _kiro_trust_scope_focused_index(pane: str) -> int | None:
+    """Return the 0-based index of the trust-scope row currently focused, if any."""
+    lines = pane.splitlines()
+    header_idx = _kiro_trust_scope_header_index(lines)
+    if header_idx is None:
+        return None
+    index = 0
+    for line in lines[header_idx + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _KIRO_SEPARATOR in stripped or stripped.startswith("esc "):
+            break
+        if stripped.startswith("❯"):
+            return index
+        index += 1
+    return None
+
+
 def _wait_for_kiro_permission_prompt(
     socket_path: str,
     tmux_target: str,
@@ -539,6 +614,7 @@ def _wait_for_focus(
     *,
     focus_check: Callable[[str], bool],
     timeout_s: float,
+    prompt_active_check: Callable[[str], bool] = _kiro_permission_prompt_active,
 ) -> str:
     """Poll the pane until ``focus_check`` holds; return the last captured pane.
 
@@ -552,12 +628,17 @@ def _wait_for_focus(
     ``_wait_for_kiro_permission_prompt`` already uses to wait for the prompt
     to first appear, applied to each individual focus check instead of just
     the initial one.
+
+    ``prompt_active_check`` defaults to the top-level permission prompt's
+    marker check; ``send_kiro_trust_scope_verdict`` passes
+    ``_kiro_trust_scope_active`` instead, since it navigates the *submenu*
+    Kiro opens after "Trust, always allow" rather than the top-level prompt.
     """
     deadline = time.monotonic() + timeout_s
     pane = ""
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if _kiro_permission_prompt_active(pane) and focus_check(pane):
+        if prompt_active_check(pane) and focus_check(pane):
             return pane
         time.sleep(_POLL_INTERVAL_S)
     return pane
@@ -829,6 +910,117 @@ def send_kiro_permission_verdict(
     )
     if not (_kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_reject(pane)):
         raise RuntimeError("kiro-native reject option was not safely focused before delivery")
+    time.sleep(_PERMISSION_ENTER_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+
+
+def navigate_to_kiro_trust_scope(
+    bridge_dir: Path,
+    *,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> list[str]:
+    """Select "Trust, always allow" and report the trust-scope submenu it opens.
+
+    Some prompt kinds (observed: shell) don't complete the trust-always
+    verdict on this Enter — Kiro instead opens a second, local-only submenu
+    asking exactly what to trust (e.g. "Full command" / "Partial command" /
+    "Base command" / "Entire tool" — see ``_kiro_trust_scope_rows``). This
+    performs that first navigation step and returns the submenu's rows
+    verbatim so a caller (``kiro_native_permissions.py``) can ask a human
+    which one to pick, then finish the flow via
+    ``send_kiro_trust_scope_verdict``.
+
+    Returns an empty list if the prompt instead resolves directly with no
+    submenu (no further action needed) — not every prompt kind is known to
+    offer scoped trust, and treating "no submenu appeared" as an error would
+    wrongly fail prompt kinds that simply don't have one.
+
+    :raises RuntimeError: if the top-level prompt is never safely focused on
+        "Trust, always allow", or if neither the submenu nor prompt
+        resolution is observed before *timeout_s*.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "kiro terminal is no longer running (the TUI exited); restart the session"
+        )
+    _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=_kiro_permission_focus_on_always_allow,
+        timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+    )
+    if not (_kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_always_allow(pane)):
+        raise RuntimeError(
+            "kiro-native trust-always option was not safely focused before delivery"
+        )
+    time.sleep(_PERMISSION_ENTER_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _kiro_trust_scope_active(pane):
+            return _kiro_trust_scope_rows(pane)
+        if not _kiro_permission_prompt_active(pane):
+            # The whole prompt resolved directly — this prompt kind has no
+            # trust-scope submenu.
+            return []
+        time.sleep(_POLL_INTERVAL_S)
+    raise RuntimeError(
+        "kiro-native trust-scope submenu did not appear and the prompt did not "
+        "resolve after selecting trust-always"
+    )
+
+
+def send_kiro_trust_scope_verdict(
+    bridge_dir: Path,
+    *,
+    option_index: int,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Complete a pending trust-scope submenu by selecting ``option_index``.
+
+    ``option_index`` is 0-based, in the on-screen order returned by
+    ``navigate_to_kiro_trust_scope`` — that call must have already opened
+    this submenu for the same session; this only finishes it.
+    """
+    if option_index < 0:
+        raise RuntimeError(f"invalid kiro trust-scope option_index: {option_index!r}")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "kiro terminal is no longer running (the TUI exited); restart the session"
+        )
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _kiro_trust_scope_active(_capture_pane(socket_path, tmux_target)):
+            break
+        time.sleep(_POLL_INTERVAL_S)
+    else:
+        raise RuntimeError(
+            "kiro-native trust-scope submenu was not visible before verdict delivery"
+        )
+    for _ in range(option_index):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=lambda p: _kiro_trust_scope_focused_index(p) == option_index,
+        timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+        prompt_active_check=_kiro_trust_scope_active,
+    )
+    if _kiro_trust_scope_focused_index(pane) != option_index:
+        raise RuntimeError("kiro-native trust-scope option was not safely focused before delivery")
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     time.sleep(_PERMISSION_KEY_INTERVAL_S)

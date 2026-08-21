@@ -13,7 +13,12 @@ from typing import Any
 
 import httpx
 
-from omnigent.kiro_native_bridge import acp_record_path, send_kiro_permission_verdict
+from omnigent.kiro_native_bridge import (
+    acp_record_path,
+    navigate_to_kiro_trust_scope,
+    send_kiro_permission_verdict,
+    send_kiro_trust_scope_verdict,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -381,6 +386,98 @@ async def supervise_kiro_permission_mirror(
             await asyncio.sleep(poll_interval_s)
 
 
+async def _resolve_kiro_trust_scope_index(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    permission: KiroPermissionRequest,
+    elicitation_id: str,
+    rows: list[str],
+) -> int | None:
+    """Ask the web UI which live trust-scope row to pick; return its index.
+
+    Publishes a second card (via the same native-permission-request hook,
+    given ``options``) carrying Kiro's own submenu rows verbatim — see the
+    server-side ``options`` handling in ``native_permission_request_hook``.
+    ApprovalCard's existing multi-choice branch renders it with no new UI
+    code; the answer comes back as ``content.answer``, one of ``rows``.
+    Returns ``None`` on any failure to get a matching answer (hook POST
+    exhausted retries, non-2xx, malformed body, or an answer that doesn't
+    match a row — e.g. Kiro's submenu changed shape between publish and
+    reply), leaving the caller to decide how to handle an unresolved pick.
+    """
+    payload: dict[str, Any] = {
+        "elicitation_id": f"{elicitation_id}_scope",
+        "agent": "Kiro",
+        "policy_name": "kiro_native_trust_scope",
+        "operation_type": "tool",
+        "message": f"O que confiar para `{permission.preview}`?",
+        "options": rows,
+    }
+    response = await _post_hook_with_retry(client, session_id=session_id, payload=payload)
+    if response is None or response.status_code >= 400 or not response.content:
+        return None
+    try:
+        result = response.json()
+    except ValueError:
+        return None
+    if not isinstance(result, dict) or result.get("action") != "accept":
+        return None
+    content = result.get("content")
+    answer = content.get("answer") if isinstance(content, dict) else None
+    if not isinstance(answer, str):
+        return None
+    try:
+        return rows.index(answer)
+    except ValueError:
+        return None
+
+
+async def _deliver_allow_always(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    permission: KiroPermissionRequest,
+    elicitation_id: str,
+) -> None:
+    """Complete a "Trust, always allow" verdict, following Kiro's own trust-scope submenu.
+
+    Some prompt kinds (observed: shell) don't resolve on "Trust, always
+    allow" alone — Kiro opens a second, local-only submenu asking exactly
+    what to trust (e.g. "Full command" / "Base command" / "Entire tool"; see
+    ``navigate_to_kiro_trust_scope``'s docstring). Rather than guess which
+    one the user meant, this mirrors the live rows to a second web card
+    (``_resolve_kiro_trust_scope_index``) and finishes the flow with
+    whichever one the human actually picks — the same navigation a human
+    typing directly into the TUI would do.
+
+    :raises RuntimeError: propagated from the bridge if the tmux delivery
+        itself fails (caller's ``except RuntimeError`` handles the notice).
+    """
+    rows = await asyncio.to_thread(navigate_to_kiro_trust_scope, bridge_dir)
+    if not rows:
+        # No submenu appeared — this prompt kind resolved directly on
+        # "Trust, always allow", nothing more to do.
+        return
+    chosen_index = await _resolve_kiro_trust_scope_index(
+        client,
+        session_id=session_id,
+        permission=permission,
+        elicitation_id=elicitation_id,
+        rows=rows,
+    )
+    if chosen_index is None:
+        # The submenu is still open in the TUI (navigate_to_kiro_trust_scope
+        # only opened it, never selected a row) — surface that explicitly
+        # rather than leaving it silently stuck, mirroring the notice the
+        # caller posts on a bridge-delivery RuntimeError.
+        raise RuntimeError(
+            f"kiro-native trust-scope pick for {permission.request_id} was not resolved"
+        )
+    await asyncio.to_thread(send_kiro_trust_scope_verdict, bridge_dir, option_index=chosen_index)
+
+
 async def _run_one_permission(
     client: httpx.AsyncClient,
     *,
@@ -509,12 +606,21 @@ async def _run_one_permission(
         # request has been confirmed resolved (see _DeliveryCoordinator).
         await coordinator.wait_turn(permission.request_id)
         try:
-            await asyncio.to_thread(
-                send_kiro_permission_verdict,
-                bridge_dir,
-                action=deliver_action,
-                has_trust_always_option=permission.always_option_id is not None,
-            )
+            if deliver_action == "allow_always":
+                await _deliver_allow_always(
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    permission=permission,
+                    elicitation_id=elicitation_id,
+                )
+            else:
+                await asyncio.to_thread(
+                    send_kiro_permission_verdict,
+                    bridge_dir,
+                    action=deliver_action,
+                    has_trust_always_option=permission.always_option_id is not None,
+                )
             delivered_ok = True
         except RuntimeError:
             _logger.exception(
