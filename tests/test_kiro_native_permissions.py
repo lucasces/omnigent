@@ -205,11 +205,20 @@ async def test_run_one_permission_posts_then_delivers_verdict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     delivered: list[tuple[Path, str]] = []
+    trust_scope_navigations: list[Path] = []
 
     def _fake_send(bridge_dir: Path, *, action: str, **_kw: object) -> None:
         delivered.append((bridge_dir, action))
 
+    def _fake_navigate(bridge_dir: Path, **_kw: object) -> list[str]:
+        # No submenu offered for this prompt kind — the "Trust, always
+        # allow" verdict resolves directly. The submenu-present path is
+        # covered by test_deliver_allow_always_resolves_trust_scope_pick.
+        trust_scope_navigations.append(bridge_dir)
+        return []
+
     monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
+    monkeypatch.setattr(knp, "navigate_to_kiro_trust_scope", _fake_navigate)
     req = parse_permission_request(_permission_msg("req-1"))
     assert req is not None
     # A second queued response absorbs the "hook rejected" assistant-notice
@@ -243,8 +252,134 @@ async def test_run_one_permission_posts_then_delivers_verdict(
     }
     if expected_action is None:
         assert delivered == []
+        assert trust_scope_navigations == []
+    elif expected_action == "allow_always":
+        # allow_always routes through navigate_to_kiro_trust_scope instead
+        # of send_kiro_permission_verdict — see _deliver_allow_always.
+        assert delivered == []
+        assert trust_scope_navigations == [tmp_path]
     else:
         assert delivered == [(tmp_path, expected_action)]
+        assert trust_scope_navigations == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_kiro_trust_scope_index_matches_chosen_row() -> None:
+    """The trust-scope card's answer maps back to the matching row index."""
+    rows = ["Full command   sleep 5", "Partial command   sleep 5 *", "Base command   sleep *"]
+    client = _QueueClient(
+        [httpx.Response(200, json={"action": "accept", "content": {"answer": rows[1]}})]
+    )
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+
+    index = await knp._resolve_kiro_trust_scope_index(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        permission=req,
+        elicitation_id="elic_1",
+        rows=rows,
+    )
+
+    assert index == 1
+    url, body = client.posts[0]
+    assert url == "/v1/sessions/conv_1/hooks/native-permission-request"
+    assert body["elicitation_id"] == "elic_1_scope"
+    assert body["options"] == rows
+
+
+@pytest.mark.asyncio
+async def test_resolve_kiro_trust_scope_index_none_on_unmatched_answer() -> None:
+    """An answer that doesn't match any row (e.g. Kiro's submenu changed shape) resolves to None."""
+    client = _QueueClient(
+        [httpx.Response(200, json={"action": "accept", "content": {"answer": "not a row"}})]
+    )
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+
+    index = await knp._resolve_kiro_trust_scope_index(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        permission=req,
+        elicitation_id="elic_1",
+        rows=["Full command   pwd", "Entire tool"],
+    )
+
+    assert index is None
+
+
+@pytest.mark.asyncio
+async def test_deliver_allow_always_resolves_trust_scope_pick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Kiro opens a trust-scope submenu, the human's pick finishes it.
+
+    Covers the branch test_run_one_permission_posts_then_delivers_verdict's
+    [accept-trust-always] case deliberately skips (there, navigate returns no
+    rows at all).
+    """
+    rows = ["Full command   sleep 5", "Entire tool"]
+    navigate_calls: list[Path] = []
+    finish_calls: list[tuple[Path, int]] = []
+
+    def _fake_navigate(bridge_dir: Path, **_kw: object) -> list[str]:
+        navigate_calls.append(bridge_dir)
+        return rows
+
+    def _fake_finish(bridge_dir: Path, *, option_index: int, **_kw: object) -> None:
+        finish_calls.append((bridge_dir, option_index))
+
+    monkeypatch.setattr(knp, "navigate_to_kiro_trust_scope", _fake_navigate)
+    monkeypatch.setattr(knp, "send_kiro_trust_scope_verdict", _fake_finish)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient(
+        [httpx.Response(200, json={"action": "accept", "content": {"answer": rows[1]}})]
+    )
+
+    await knp._deliver_allow_always(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+    )
+
+    assert navigate_calls == [tmp_path]
+    assert finish_calls == [(tmp_path, 1)]
+
+
+@pytest.mark.asyncio
+async def test_deliver_allow_always_raises_when_pick_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved trust-scope pick (bad hook POST, mismatched answer) surfaces as an error.
+
+    Regression guard: silently leaving the TUI's submenu open with no error
+    would look identical to the "still thinking" state the bridge's other
+    failure paths are careful to avoid (see _run_one_permission's
+    RuntimeError handling).
+    """
+
+    def _fake_navigate(bridge_dir: Path, **_kw: object) -> list[str]:
+        del bridge_dir
+        return ["Full command   pwd"]
+
+    monkeypatch.setattr(knp, "navigate_to_kiro_trust_scope", _fake_navigate)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient([httpx.Response(400, text="nope"), httpx.Response(200)])
+
+    with pytest.raises(RuntimeError, match="trust-scope pick"):
+        await knp._deliver_allow_always(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            bridge_dir=tmp_path,
+            permission=req,
+            elicitation_id="elic_1",
+        )
 
 
 @pytest.mark.asyncio

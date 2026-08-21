@@ -343,6 +343,61 @@ async def test_qwen_permission_request_hook_allow_round_trip(
     assert resp.json() == {"action": "accept"}
 
 
+async def test_native_permission_request_hook_options_builds_multi_choice_schema(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``options`` on the generic native-permission-request hook builds a
+    multi-choice ``requestedSchema`` that ApprovalCard's existing option-
+    button branch renders, and the picked label round-trips as
+    ``content.answer``.
+
+    Exercised by the kiro-native mirror's trust-scope follow-up card (see
+    ``_resolve_kiro_trust_scope_index`` in kiro_native_permissions.py):
+    after a human picks "Trust, always allow", Kiro's TUI opens its own
+    submenu asking exactly what to trust (e.g. "Full command" / "Base
+    command" / "Entire tool"). Rather than a bespoke card type, this mirrors
+    those live rows into a plain multi-choice elicitation.
+    """
+    agent = await create_test_agent(client, "test-kiro-trust-scope")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_kiro_{session_id}_r1_scope"
+    rows = ["Full command   sleep 5", "Partial command   sleep 5 *", "Entire tool"]
+    payload = {
+        "elicitation_id": elicitation_id,
+        "agent": "Kiro",
+        "policy_name": "kiro_native_trust_scope",
+        "operation_type": "tool",
+        "message": "O que confiar para `sleep 5`?",
+        "options": rows,
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/native-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    params = event["params"]
+    assert params["requestedSchema"] == {
+        "properties": {"answer": {"type": "string", "enum": rows}}
+    }
+
+    verdict = await _post_approval(
+        client, session_id, elicitation_id, "accept", {"answer": rows[1]}
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "accept", "content": {"answer": rows[1]}}
+
+
 async def test_cursor_permission_request_hook_stamps_ask_user_question_extra(
     client: httpx.AsyncClient,
 ) -> None:
