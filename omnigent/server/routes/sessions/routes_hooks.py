@@ -1345,7 +1345,9 @@ def register_hooks_routes(
 
         :param request: FastAPI request carrying the detected prompt
             (``elicitation_id``, ``message``, ``content_preview``,
-            ``operation_type``, optional ``agent`` / ``policy_name``).
+            ``operation_type``, optional ``agent`` / ``policy_name``, optional
+            ``options`` — a non-empty list of strings that turns the card into
+            a multi-choice picker returning ``content.answer``).
         :param session_id: Omnigent conversation id from the URL path.
         :returns: An ``ElicitationResult`` (``{"action": …}``) on a web verdict,
             or ``200`` with empty body on TUI-resolution / timeout / disconnect.
@@ -1412,10 +1414,27 @@ def register_hooks_routes(
         # don't send it) are unaffected.
         if payload.get("kiro_trust_always") is True:
             extras["kiro_trust_always"] = True
+        # Turns this card into a multi-choice picker (ApprovalCard's existing
+        # ``isMultiChoice`` branch, driven purely by ``requestedSchema`` — no
+        # new UI needed). Currently only sent by the kiro-native mirror's
+        # trust-scope follow-up card (see ``_resolve_kiro_trust_scope_index``
+        # in kiro_native_permissions.py): after the user picks "Trust, always
+        # allow", Kiro's TUI opens its own submenu asking exactly what to
+        # trust (e.g. "Full command" / "Base command" / "Entire tool"); this
+        # mirrors those live options to the web verbatim instead of the
+        # bridge guessing one on the user's behalf.
+        options = payload.get("options")
+        requested_schema: dict[str, Any] | None = None
+        if (
+            isinstance(options, list)
+            and options
+            and all(isinstance(opt, str) and opt for opt in options)
+        ):
+            requested_schema = {"properties": {"answer": {"type": "string", "enum": options}}}
         params = ElicitationRequestParams(
             mode="form",
             message=message,
-            requestedSchema=None,
+            requestedSchema=requested_schema,
             url=None,
             phase="pre_tool_use",
             policy_name=policy_name,
