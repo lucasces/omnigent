@@ -5927,6 +5927,30 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_kiro_native_compact(conv_id: str) -> Response:
+        from omnigent.harnesses.kiro_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_user_message,
+        )
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_user_message,
+                bridge_dir,
+                content="/compact",
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
@@ -8918,6 +8942,8 @@ def create_runner_app(
                 return await _handle_hermes_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "qwen-native":
                 return await _handle_qwen_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "kiro-native":
+                return await _handle_kiro_native_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "clear":
