@@ -486,22 +486,31 @@ def _kiro_permission_prompt_active(pane: str) -> bool:
     return all(marker in pane for marker in _KIRO_PERMISSION_MARKERS)
 
 
+# Each focus check matches only a SHORT, unique prefix of the focused ("❯ ")
+# option row — never the full label. A narrow pane hard-wraps a long row like
+# "❯ Trust, always allow in this session" onto a second line ("❯ Trust, always
+# allow in this" / "  session"), and ``_capture_pane``'s ``-J`` only rejoins
+# tmux's own soft-wraps, not the break Kiro itself emits. Matching the full
+# string then silently fails, ``_wait_for_focus`` times out, and the verdict
+# keystroke is never confirmed (RuntimeError "... not safely focused"), wedging
+# the prompt — with "single"/"No" delivering fine (short rows never wrap) while
+# "Trust, always allow" never does. The prefixes below stay unique among Kiro's
+# three options yet short enough to survive any pane width, mirroring the
+# "keep markers short" discipline the idle markers already follow (see
+# inner/terminal.py ``_IDLE_MARKER_SUBSTRINGS``).
 def _kiro_permission_focus_on_one_time_allow(pane: str) -> bool:
     """Return whether Kiro's approval picker is focused on one-time allow."""
-    return any(line.strip().startswith("❯ Yes, single permission") for line in pane.splitlines())
+    return any(line.strip().startswith("❯ Yes,") for line in pane.splitlines())
 
 
 def _kiro_permission_focus_on_always_allow(pane: str) -> bool:
     """Return whether Kiro's approval picker is focused on trust-always."""
-    return any(
-        line.strip().startswith("❯ Trust, always allow in this session")
-        for line in pane.splitlines()
-    )
+    return any(line.strip().startswith("❯ Trust,") for line in pane.splitlines())
 
 
 def _kiro_permission_focus_on_reject(pane: str) -> bool:
     """Return whether Kiro's approval picker is focused on one-time reject."""
-    return any(line.strip().startswith("❯ No (Tab to edit)") for line in pane.splitlines())
+    return any(line.strip().startswith("❯ No") for line in pane.splitlines())
 
 
 # Kiro V3 batches every pending subagent tool-call approval behind one
