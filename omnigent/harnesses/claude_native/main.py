@@ -113,6 +113,7 @@ from omnigent.host.daemon_launch import (
 from omnigent.models import model_catalog
 from omnigent.models.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
+    CLAUDE_MODEL_ALIASES,
     CUSTOM_MODEL_OPTION_ENV_VAR,
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
@@ -1181,6 +1182,17 @@ async def probe_claude_model_options(
         return None
     text = stdout.decode(errors="replace")
     aliases = _parse_claude_enumeration_aliases(text)
+    if not aliases and claude_config is None:
+        # Claude Code >= 2.1.204 refuses the `/model` slash command in
+        # headless (-p) mode ("/model isn't available in this environment."),
+        # so the "Available: …" enumeration line is gone and a bare
+        # subscription launch would otherwise collapse to just the default
+        # (Opus). The family aliases are fixed for the subscription login,
+        # and per-alias `--model <alias>` resolution still works (it reads
+        # the launch init event, not `/model` output), so re-seed them and
+        # let the resolution + dedup below rebuild one row per servable
+        # family.
+        aliases = list(CLAUDE_MODEL_ALIASES)
     # The enumeration run's own init event names what a bare launch runs —
     # the harness's truthful Default.
     default_resolution = _parse_claude_current_model(text)
