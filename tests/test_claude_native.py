@@ -9352,6 +9352,89 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     ]
 
 
+async def test_probe_claude_model_options_falls_back_to_families_when_enumeration_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code >= 2.1.204 refuses ``/model`` in headless mode.
+
+    The enumeration run then prints no ``Available:`` line — only
+    ``/model isn't available in this environment.`` — so a bare
+    subscription launch re-seeds the fixed family aliases and resolves each
+    via its own ``--model`` run. The picker keeps one row per servable
+    family instead of collapsing to the lone default.
+    """
+    resolutions = {
+        "fable": "claude-fable-5",
+        "opus": "claude-opus-4-8",
+        "sonnet": "claude-sonnet-5",
+        "haiku": "claude-haiku-4-5-20251001",
+    }
+
+    class _Run:
+        def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+            self.returncode = returncode
+            self._stdout = stdout
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout, b""
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
+        if "--model" not in args:
+            # The 2.1.204 headless refusal: the init event still names the
+            # default, but the result carries the refusal text with no
+            # "Available:" line — enumeration yields no aliases.
+            events = [
+                {"type": "system", "subtype": "init", "model": "claude-opus-4-8"},
+                {"type": "result", "result": "/model isn't available in this environment."},
+            ]
+            return _Run("\n".join(json.dumps(event) for event in events).encode())
+        alias = args[args.index("--model") + 1]
+        events = [{"type": "system", "subtype": "init", "model": resolutions[alias]}]
+        return _Run("\n".join(json.dumps(event) for event in events).encode())
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    assert probe.alias_rows == [
+        {"id": "fable", "model": "claude-fable-5", "displayName": "fable"},
+        {"id": "opus", "model": "claude-opus-4-8", "displayName": "opus"},
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "sonnet"},
+        {"id": "haiku", "model": "claude-haiku-4-5-20251001", "displayName": "haiku"},
+    ]
+    assert probe.default_model == "claude-opus-4-8"
+
+
+async def test_probe_claude_model_options_no_family_fallback_for_configured_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal fallback is subscription-only.
+
+    A configured endpoint that enumerates nothing stays empty: its rows
+    come from its own pins, never the fixed Anthropic families it may not
+    even serve. Guards the ``claude_config is None`` condition on the
+    fallback.
+    """
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (b"/model isn't available in this environment.\n", b"")
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        assert "--model" not in args, "no family fallback means no per-alias resolution runs"
+        return _FakeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
+
+    assert probe is not None
+    assert probe.alias_rows == []
+
+
 async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
