@@ -521,7 +521,16 @@ def _kiro_permission_focus_on_reject(pane: str) -> bool:
 # opens AGENT MONITOR, a per-subagent view where each pending prompt is
 # answered with its own "y approve · n deny · t trust" shortcuts instead of
 # the top-level Down/Enter picker navigation.
-_KIRO_SUBAGENT_BATCH_MARKER = "tool approvals pending from subagents"
+#
+# The marker must be count-agnostic: Kiro pluralizes the header by the
+# pending count, so a batch of exactly ONE renders "1 tool approval pending
+# from subagents" (singular) while 2+ render "N tool approvals pending from
+# subagents" (plural). Matching the plural "approvals" missed the singular
+# case entirely, so a lone pending subagent approval was never detected and
+# _focus_kiro_subagent_prompt raised "subagent approval prompt was not
+# visible", wedging the session on every single-pending batch. The suffix
+# below is present verbatim in both forms and unique to this picker.
+_KIRO_SUBAGENT_BATCH_MARKER = "pending from subagents"
 _KIRO_AGENT_MONITOR_MARKER = "AGENT MONITOR"
 _KIRO_SUBAGENT_OUTPUT_HEADER_PREFIX = "SUBAGENT OUTPUT ["
 # Matches an AGENT MONITOR subagent row, e.g. "  1 ⚠ sleep1 Shell" or
