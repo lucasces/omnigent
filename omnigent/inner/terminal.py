@@ -1086,6 +1086,21 @@ class TerminalInstance:
             if self.keep_alive_after_exit
             else []
         )
+        # Lock the window to its created size so attached clients can't resize
+        # it. tmux's default ``window-size latest`` lets whichever client was
+        # last active drive the width; Omnigent attaches narrow control/stream
+        # clients alongside the human viewer, and when one of those (observed:
+        # 42 cols) became "latest" the window shrank and Kiro's permission
+        # picker hard-wrapped long rows like "Trust, always allow in this
+        # session", defeating the focus matchers and wedging the prompt (see
+        # kiro_native_bridge._kiro_permission_focus_on_always_allow). ``manual``
+        # makes the ``new-session -x``/``-y`` size below authoritative. It MUST
+        # run AFTER new-session: setting ``-g window-size manual`` on a fresh
+        # server before any session exists crashes tmux ("server exited
+        # unexpectedly"). manual also removes the on-attach resize entirely, so
+        # the ink repaint garble that motivated the old "deliberately small"
+        # 80x24 creation size cannot recur at the wider 120x40 used here.
+        window_size_lock: list[list[str]] = [["set-option", "-g", "window-size", "manual"]]
         cmd = [
             *self._tmux_base_cmd(),
             *_tmux_command_sequence(
@@ -1096,18 +1111,17 @@ class TerminalInstance:
                         "-d",
                         "-s",
                         self.tmux_target,
-                        # Deliberately small: first attach GROWS (lossless).
-                        # The old 200x50 meant first attach SHRANK, and ink's
-                        # cursor-up repaint (counted in unwrapped rows)
-                        # stitched frames into rewrapped debris — garbled text.
+                        # Wide enough that Kiro's longest permission row never
+                        # wraps; held fixed by ``window_size_lock`` below.
                         "-x",
-                        "80",
+                        "120",
                         "-y",
-                        "24",
+                        "40",
                         "-c",
                         effective_cwd,
                         inner_str,
                     ],
+                    *window_size_lock,
                     *pane_died_hook,
                 ]
             ),
