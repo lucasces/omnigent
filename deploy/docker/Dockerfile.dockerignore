@@ -23,7 +23,12 @@ venv/
 # build context and overlay the freshly-installed node_modules from the
 # Dockerfile's `npm ci` step — breaking `npm run build` with
 # "tsc: not found" if the host install was incomplete or wrong-platform.
-node_modules/
+# Must be `**/node_modules/`, not a bare `node_modules/`: the latter only
+# matches the context root, so a nested `web/node_modules/` (the one the
+# web-builder's `COPY web/ ./web/` overlays) slips through and clobbers the
+# container's pnpm install — its host symlinks resolve to nothing in the
+# image, and the bundler then fails with "failed to resolve import".
+**/node_modules/
 
 # Test + dev artifacts
 tests/
