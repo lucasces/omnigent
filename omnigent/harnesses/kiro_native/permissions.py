@@ -17,6 +17,7 @@ from omnigent.harnesses.kiro_native.bridge import (
     acp_record_path,
     navigate_to_kiro_subagent_trust_scope,
     navigate_to_kiro_trust_scope,
+    send_kiro_permission_reject_with_feedback,
     send_kiro_permission_verdict,
     send_kiro_subagent_permission_verdict,
     send_kiro_trust_scope_verdict,
@@ -658,6 +659,21 @@ async def _run_one_permission(
         # this particular prompt.
         if permission.always_option_id:
             payload["kiro_trust_always"] = True
+        # Tells the server (and thence the web card) this prompt can take
+        # native reject-with-feedback via Kiro's "No (Tab to edit)" →
+        # "Modify request" editor, so the card grows a "Reject with feedback"
+        # affordance. Only classic modal prompts are offered it: subagent
+        # prompts are answered through AGENT MONITOR's single-key shortcuts
+        # (y/n/t), which expose no known feedback editor, so we don't advertise
+        # a channel we can't deliver on. Every prompt carries a ``sessionId``;
+        # what makes one a *subagent* prompt is that id matching a subagent Kiro
+        # announced (see ``subagent_names`` and the delivery-time
+        # ``subagent_name`` resolution below), not merely being non-empty.
+        is_known_subagent_prompt = bool(
+            permission.subagent_session_id and permission.subagent_session_id in subagent_names
+        )
+        if not is_known_subagent_prompt:
+            payload["kiro_reject_with_feedback"] = True
         response = await _post_hook_with_retry(client, session_id=session_id, payload=payload)
         if response is None:
             # Retries exhausted — the elicitation card was never created, so
@@ -719,6 +735,17 @@ async def _run_one_permission(
             and content.get("kiro_trust_always") is True
         ):
             deliver_action = "allow_always"
+        # Reject-with-feedback rides as a content flag on a declined verdict
+        # (mirroring how "trust always" rides on an accept). When present, the
+        # server deliberately skipped the interrupt so the live prompt survives
+        # for Kiro's own "No (Tab to edit)" → "Modify request" flow, which the
+        # keystroke path below delivers. Empty/malformed feedback falls back to
+        # the plain decline (interrupt already refused the tool).
+        feedback: str | None = None
+        if action == "decline" and isinstance(content, dict):
+            raw_feedback = content.get("feedback")
+            if isinstance(raw_feedback, str) and raw_feedback.strip():
+                feedback = raw_feedback
         # Wait until this is the oldest still-unanswered request before
         # touching the shared tmux pane — Kiro only ever shows one prompt at
         # a time, and it's always this one's turn only once every older
@@ -767,6 +794,22 @@ async def _run_one_permission(
                     bridge_dir=bridge_dir,
                     permission=permission,
                     elicitation_id=elicitation_id,
+                )
+                delivered_ok = True
+            elif deliver_action == "decline" and feedback is not None:
+                # Reject-with-feedback: unlike a plain decline, the server left
+                # the prompt alive (no interrupt) so we can drive Kiro's own
+                # "No (Tab to edit)" → "Modify request" editor by keystroke. This
+                # rejects THIS tool call and steers Kiro to revise it (the turn
+                # continues; the revised call re-prompts on its own). Kiro emits
+                # a normal ``reject_once`` ACP response for this request, so
+                # ``delivered_ok`` follows the confirmed-response release path
+                # like any keystroke delivery.
+                await asyncio.to_thread(
+                    send_kiro_permission_reject_with_feedback,
+                    bridge_dir,
+                    feedback=feedback,
+                    has_trust_always_option=permission.always_option_id is not None,
                 )
                 delivered_ok = True
             elif deliver_action == "decline":

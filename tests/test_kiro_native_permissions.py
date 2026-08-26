@@ -367,6 +367,8 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         "command": "Running: pwd",
         # _permission_msg() always offers Kiro's "allow_always" option.
         "kiro_trust_always": True,
+        # A classic (non-subagent) prompt advertises native reject-with-feedback.
+        "kiro_reject_with_feedback": True,
     }
     if expected_action in (None, "decline-noop"):
         # None: the POST returned no usable action, so nothing is delivered.
@@ -642,6 +644,103 @@ async def test_run_one_permission_routes_to_subagent_delivery_when_name_known(
 
     assert subagent_delivered == [(tmp_path, "sleep1", "accept")]
     assert classic_delivered == []
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_routes_decline_with_feedback_to_native_editor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A classic decline carrying feedback drives Kiro's "Modify request" editor.
+
+    The web card's "Reject with feedback" flow returns
+    ``action: "decline"`` with ``content.feedback``; the mirror must route it
+    to ``send_kiro_permission_reject_with_feedback`` (Tab-to-edit path) rather
+    than the plain-decline no-op — the latter relies on the server interrupt,
+    which the server deliberately skips when feedback is present.
+    """
+    feedback_delivered: list[tuple[Path, str, bool]] = []
+    plain_declined: list[tuple[Path, str]] = []
+
+    def _fake_reject_with_feedback(
+        bridge_dir: Path, *, feedback: str, has_trust_always_option: bool, **_kw: object
+    ) -> None:
+        feedback_delivered.append((bridge_dir, feedback, has_trust_always_option))
+
+    def _fake_send(bridge_dir: Path, *, action: str, **_kw: object) -> None:
+        plain_declined.append((bridge_dir, action))
+
+    monkeypatch.setattr(
+        knp, "send_kiro_permission_reject_with_feedback", _fake_reject_with_feedback
+    )
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient(
+        [httpx.Response(200, json={"action": "decline", "content": {"feedback": "use printf"}})]
+    )
+    coordinator = knp._DeliveryCoordinator()
+    coordinator.register("req-1")
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        coordinator=coordinator,
+        subagent_names={},
+    )
+
+    assert feedback_delivered == [(tmp_path, "use printf", True)]
+    assert plain_declined == []
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_blank_feedback_decline_is_plain_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whitespace-only feedback is not real feedback — fall back to plain decline.
+
+    A blank ``content.feedback`` must NOT open the "Modify request" editor
+    (there's nothing to steer with), and must NOT type "No" either — the
+    server interrupt already refused the tool (see the classic-decline no-op
+    branch in ``_run_one_permission``).
+    """
+    feedback_delivered: list[object] = []
+    plain_declined: list[object] = []
+
+    def _fake_reject_with_feedback(bridge_dir: Path, **_kw: object) -> None:
+        feedback_delivered.append(bridge_dir)
+
+    def _fake_send(bridge_dir: Path, *, action: str, **_kw: object) -> None:
+        plain_declined.append((bridge_dir, action))
+
+    monkeypatch.setattr(
+        knp, "send_kiro_permission_reject_with_feedback", _fake_reject_with_feedback
+    )
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient(
+        [httpx.Response(200, json={"action": "decline", "content": {"feedback": "   "}})]
+    )
+    coordinator = knp._DeliveryCoordinator()
+    coordinator.register("req-1")
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        coordinator=coordinator,
+        subagent_names={},
+    )
+
+    assert feedback_delivered == []
+    assert plain_declined == []
 
 
 @pytest.mark.asyncio

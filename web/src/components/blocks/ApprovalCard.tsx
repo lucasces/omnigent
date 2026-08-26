@@ -41,8 +41,10 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
+import { useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -166,6 +168,16 @@ interface ApprovalCardProps {
    */
   kiroTrustAlways?: boolean;
   /**
+   * Kiro-native classic permission prompts only: when true, the Kiro
+   * command-approval card grows a "Reject with feedback" button that reveals
+   * a textarea. Declining through it sends the typed feedback on
+   * ``content.feedback``; the runner-side mirror drives Kiro's own "No (Tab to
+   * edit)" → "Modify request" editor so Kiro rejects the tool and revises
+   * toward the feedback (the turn keeps going). Absent/false for subagent
+   * prompts (no known editor) and every other elicitation.
+   */
+  kiroRejectWithFeedback?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: when set, the binary
    * approve/reject card grows a third "Approve & don't ask again for
    * <host|tool>" button. Accepting through it asks the server to
@@ -205,6 +217,7 @@ export function ApprovalCard({
   kiroCommand,
   allowAllEdits,
   kiroTrustAlways,
+  kiroRejectWithFeedback,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
@@ -268,10 +281,12 @@ export function ApprovalCard({
   const submitCodexPersist = (mode: CodexPersistMode) => {
     submit(elicitationId, "accept", undefined, { persist: mode });
   };
-  const submitPlanRejection = (feedback: string) => {
-    // The typed feedback rides on `content.feedback`; the server
-    // forwards it to Claude as the deny `message`, so Claude stays in
-    // plan mode and revises toward it. Empty feedback → plain decline.
+  const submitDeclineWithFeedback = (feedback: string) => {
+    // The typed feedback rides on `content.feedback`. For ExitPlanMode the
+    // server forwards it to Claude as the deny `message` (Claude stays in
+    // plan mode and revises toward it); for a kiro-native command prompt the
+    // runner-side mirror drives Kiro's own "No (Tab to edit)" → "Modify
+    // request" editor. Empty feedback → plain decline.
     const trimmed = feedback.trim();
     submit(elicitationId, "decline", trimmed ? { feedback: trimmed } : undefined);
   };
@@ -482,11 +497,11 @@ export function ApprovalCard({
       !isAskUserQuestion && response.content && typeof response.content.answer === "string"
         ? (response.content.answer as string)
         : null;
-    // Plan rejections can carry the feedback the user typed into the
-    // card; echo it on the responded pill so the chat shows WHY the
-    // plan went back for revision.
-    const planRejectionFeedback =
-      isExitPlanMode &&
+    // Rejections that carry feedback (ExitPlanMode "Reject with feedback", or
+    // a kiro-native "Reject with feedback") echo the typed text on the
+    // responded pill so the chat shows WHY the tool/plan went back for
+    // revision.
+    const declineFeedback =
       response.action === "decline" &&
       typeof response.content?.feedback === "string" &&
       response.content.feedback
@@ -546,7 +561,7 @@ export function ApprovalCard({
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
-      planRejectionFeedback !== null;
+      declineFeedback !== null;
 
     return (
       <Alert
@@ -595,9 +610,9 @@ export function ApprovalCard({
                 ))}
               </ul>
             )}
-            {planRejectionFeedback !== null && (
+            {declineFeedback !== null && (
               <span className="italic" data-testid="plan-rejection-feedback">
-                “{planRejectionFeedback}”
+                “{declineFeedback}”
               </span>
             )}
           </AlertDescription>
@@ -645,7 +660,7 @@ export function ApprovalCard({
               plan={planMarkdown}
               onAcceptAuto={submitAllowAllEdits}
               onAccept={() => submitBinary("accept")}
-              onReject={submitPlanRejection}
+              onReject={submitDeclineWithFeedback}
             />
           </>
         ) : isAskUserQuestion ? (
@@ -675,7 +690,17 @@ export function ApprovalCard({
             <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap break-words">
               {kiroCommand.command}
             </pre>
-            {binaryButtons}
+            {kiroRejectWithFeedback ? (
+              <KiroCommandActions
+                allowTrustAlways={kiroTrustAlways === true}
+                onApprove={() => submitBinary("accept")}
+                onTrustAlways={submitTrustAlways}
+                onReject={() => submitBinary("decline")}
+                onRejectWithFeedback={submitDeclineWithFeedback}
+              />
+            ) : (
+              binaryButtons
+            )}
           </>
         ) : (
           <>
@@ -724,6 +749,95 @@ export function ApprovalCard({
 }
 
 /**
+ * Kiro command-approval action row with native reject-with-feedback.
+ *
+ * Rendered instead of the plain binary buttons when the kiro-native mirror
+ * marks the prompt as supporting Kiro's "No (Tab to edit)" → "Modify request"
+ * editor (classic, non-subagent prompts). Keeps the one-click Approve /
+ * optional trust-always / plain Reject buttons, and adds a "Reject with
+ * feedback" button that reveals a textarea — declining through it sends the
+ * typed text on ``content.feedback`` so the mirror drives Kiro's editor and
+ * Kiro revises the tool call. Mirrors ``ExitPlanModeReview``'s reject flow.
+ */
+function KiroCommandActions({
+  allowTrustAlways,
+  onApprove,
+  onTrustAlways,
+  onReject,
+  onRejectWithFeedback,
+}: {
+  allowTrustAlways: boolean;
+  onApprove: () => void;
+  onTrustAlways: () => void;
+  onReject: () => void;
+  onRejectWithFeedback: (feedback: string) => void;
+}) {
+  const [rejecting, setRejecting] = useState(false);
+  const [feedback, setFeedback] = useState("");
+
+  if (rejecting) {
+    return (
+      <div className="flex flex-col gap-2 pt-1" data-testid="kiro-command-feedback">
+        <Textarea
+          autoFocus
+          placeholder="What should Kiro change? (optional)"
+          value={feedback}
+          onChange={(e) => setFeedback(e.target.value)}
+          className="min-h-20 text-ui"
+          componentId="kiro.feedback"
+        />
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            onClick={() => onRejectWithFeedback(feedback)}
+            componentId="kiro.reject_feedback"
+          >
+            <XIcon className="mr-1 size-3.5" />
+            Reject &amp; send feedback
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setRejecting(false)}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap gap-2 pt-1" data-testid="kiro-command-actions">
+      <Button size="sm" onClick={onApprove} componentId="approval.approve">
+        <CheckIcon className="mr-1 size-3.5" />
+        Approve
+      </Button>
+      {allowTrustAlways && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={onTrustAlways}
+          data-testid="approval-card-trust-always"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve &amp; trust for this session
+        </Button>
+      )}
+      <Button size="sm" variant="outline" onClick={onReject} componentId="approval.reject">
+        <XIcon className="mr-1 size-3.5" />
+        Reject
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => setRejecting(true)}
+        data-testid="kiro-reject-with-feedback"
+      >
+        <XIcon className="mr-1 size-3.5" />
+        Reject with feedback
+      </Button>
+    </div>
+  );
+}
+
+/**
  * Render an elicitation ``RenderItem`` as an ``ApprovalCard``. The prop
  * mapping lives here, in one place, so the two callers stay in sync:
  * ``BlockRenderer`` (inline in the message stream) and ``ChatPage``'s
@@ -754,6 +868,7 @@ export function ElicitationCard({
       kiroCommand={item.kiroCommand}
       allowAllEdits={item.allowAllEdits}
       kiroTrustAlways={item.kiroTrustAlways}
+      kiroRejectWithFeedback={item.kiroRejectWithFeedback}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
       onSubmit={onSubmit}

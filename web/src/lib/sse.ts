@@ -1022,6 +1022,10 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // kiro_native_permissions.py). Drives ApprovalCard's third
     // "Approve & trust for this session" button.
     const kiroTrustAlways = p.kiro_trust_always === true;
+    // kiro-native mirror stamps this on classic (non-subagent) prompts, which
+    // support Kiro's own "No (Tab to edit)" → "Modify request" editor. Drives
+    // ApprovalCard's "Reject with feedback" affordance.
+    const kiroRejectWithFeedback = p.kiro_reject_with_feedback === true;
     // claude-native non-edit tool prompts stamp this so the ApprovalCard
     // offers the persistent "don't ask again" button (installs a
     // session-scoped allow rule on accept). `tool` is the gated tool;
@@ -1106,6 +1110,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           : null,
       allowAllEdits,
       kiroTrustAlways,
+      kiroRejectWithFeedback,
       rememberScope,
       codexPersistModes,
     } satisfies ElicitationRequest;

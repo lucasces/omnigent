@@ -272,6 +272,16 @@ export interface ElicitationRequest {
    */
   kiroTrustAlways?: boolean;
   /**
+   * Producer-supplied extra (kiro-native classic permission prompts only):
+   * present when the prompt supports Kiro's own "No (Tab to edit)" →
+   * "Modify request" editor. The ApprovalCard renders a "Reject with
+   * feedback" button that, on decline, sends the typed feedback through
+   * `content.feedback`; the runner-side mirror drives the native editor so
+   * Kiro rejects the tool and revises toward the feedback. Absent for
+   * subagent prompts (no known editor there) and all other elicitations.
+   */
+  kiroRejectWithFeedback?: boolean;
+  /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
    * supports a persistent "don't ask again" allow rule (everything
