@@ -872,6 +872,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         kiroCommand: event.kiroCommand,
         allowAllEdits: event.allowAllEdits,
         kiroTrustAlways: event.kiroTrustAlways,
+        kiroRejectWithFeedback: event.kiroRejectWithFeedback,
         rememberScope: event.rememberScope,
       } satisfies ElicitationBlock;
       return;

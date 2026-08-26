@@ -507,6 +507,14 @@ export interface ElicitationBlock {
    */
   kiroTrustAlways?: boolean;
   /**
+   * Kiro-native classic permission prompts only: when true, the card renders
+   * a "Reject with feedback" button that opens a textarea and, on decline,
+   * sends the typed feedback on `content.feedback` so the runner-side mirror
+   * drives Kiro's "No (Tab to edit)" → "Modify request" editor. Absent for
+   * subagent prompts and all other elicitations.
+   */
+  kiroRejectWithFeedback?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button
    * that installs a session-scoped allow rule on accept (the web

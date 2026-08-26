@@ -1479,6 +1479,122 @@ async def test_permission_request_hook_decline_forwards_feedback_message(
     }
 
 
+def _kiro_reject_feedback_payload(elicitation_id: str) -> dict[str, Any]:
+    """A kiro-native classic-prompt hook body advertising reject-with-feedback."""
+    return {
+        "elicitation_id": elicitation_id,
+        "agent": "Kiro",
+        "policy_name": "kiro_native_permission",
+        "operation_type": "tool",
+        "message": "Kiro wants approval for Running: echo hi",
+        "content_preview": "Running: echo hi",
+        "command": "echo hi",
+        "kiro_trust_always": True,
+        "kiro_reject_with_feedback": True,
+    }
+
+
+async def test_native_permission_request_hook_reject_with_feedback_skips_interrupt(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A kiro-native decline carrying ``content.feedback`` round-trips the
+    feedback AND must NOT interrupt the harness.
+
+    The runner-side mirror delivers that feedback through Kiro's own "No (Tab
+    to edit)" → "Modify request" editor, which keeps the turn alive. Forwarding
+    the usual decline interrupt (``{"type": "interrupt"}`` → Escape) would tear
+    that live prompt down before the keystrokes land, so the server skips it
+    when — and only when — the decline carries non-empty feedback.
+    """
+    from omnigent.server.routes.sessions import routes_hooks
+
+    forwarded: list[dict[str, Any]] = []
+
+    async def _spy_forward(_session_id: str, _router: object, change: dict[str, Any]) -> None:
+        forwarded.append(change)
+
+    monkeypatch.setattr(routes_hooks, "_forward_session_change_to_runner", _spy_forward)
+
+    agent = await create_test_agent(client, "test-kiro-reject-feedback")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_kiro_{session_id}_rf1"
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/native-permission-request",
+            json=_kiro_reject_feedback_payload(elicitation_id),
+        )
+    )
+
+    event = await drain_task
+    # The card must learn the prompt supports native reject-with-feedback.
+    assert event["params"]["kiro_reject_with_feedback"] is True
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        "decline",
+        content={"feedback": "use printf instead"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "decline",
+        "content": {"feedback": "use printf instead"},
+    }
+    # No interrupt: the live prompt must survive for the Tab-to-edit keystrokes.
+    assert forwarded == []
+
+
+async def test_native_permission_request_hook_plain_decline_forwards_interrupt(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kiro-native decline with NO feedback keeps the interrupt path.
+
+    The counterpart to the reject-with-feedback case: a bare decline is
+    delivered out-of-band by the interrupt (Escape → session/cancel), so the
+    server must still forward it.
+    """
+    from omnigent.server.routes.sessions import routes_hooks
+
+    forwarded: list[dict[str, Any]] = []
+
+    async def _spy_forward(_session_id: str, _router: object, change: dict[str, Any]) -> None:
+        forwarded.append(change)
+
+    monkeypatch.setattr(routes_hooks, "_forward_session_change_to_runner", _spy_forward)
+
+    agent = await create_test_agent(client, "test-kiro-plain-decline")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_kiro_{session_id}_pd1"
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/native-permission-request",
+            json=_kiro_reject_feedback_payload(elicitation_id),
+        )
+    )
+
+    await drain_task
+    verdict = await _post_approval(client, session_id, elicitation_id, "decline")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "decline"}
+    assert forwarded == [{"type": "interrupt"}]
+
+
 async def test_permission_request_hook_omits_structured_extras_for_other_tools(
     client: httpx.AsyncClient,
 ) -> None:

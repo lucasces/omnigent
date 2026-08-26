@@ -1287,3 +1287,146 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     );
   });
 });
+
+describe("ApprovalCard — Kiro command reject-with-feedback", () => {
+  const kiroProps = {
+    message: "Kiro wants approval for Running: echo hi",
+    phase: "pre_tool_use",
+    policyName: "kiro_native_permission",
+    contentPreview: "Running: echo hi",
+    requestedSchema: {},
+    kiroCommand: { command: "echo hi" },
+  } as const;
+
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_abc", blocks: [] });
+  });
+
+  it("adds a 'Reject with feedback' button only when the prompt supports it", () => {
+    // The mirror stamps kiroRejectWithFeedback only for classic prompts that
+    // can drive Kiro's "No (Tab to edit)" editor. Without the hint the card
+    // must fall back to the plain binary buttons — offering feedback we can't
+    // deliver (e.g. on a subagent prompt) would silently drop it.
+    const { rerender } = render(
+      <ApprovalCard
+        elicitationId="elic_kiro_rf"
+        status="pending"
+        response={null}
+        kiroRejectWithFeedback={true}
+        kiroTrustAlways={true}
+        {...kiroProps}
+      />,
+    );
+    expect(screen.getByTestId("kiro-command-actions")).toBeDefined();
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /trust for this session/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /^reject$/i })).toBeDefined();
+    expect(screen.getByTestId("kiro-reject-with-feedback")).toBeDefined();
+
+    rerender(
+      <ApprovalCard
+        elicitationId="elic_kiro_plain"
+        status="pending"
+        response={null}
+        {...kiroProps}
+      />,
+    );
+    expect(screen.queryByTestId("kiro-command-actions")).toBeNull();
+    expect(screen.queryByTestId("kiro-reject-with-feedback")).toBeNull();
+  });
+
+  it("reveals a textarea and submits decline with the typed feedback", () => {
+    // The feedback rides on ``content.feedback``; the runner-side mirror
+    // drives Kiro's "Modify request" editor with it so Kiro revises the tool.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+    render(
+      <ApprovalCard
+        elicitationId="elic_kiro_reject"
+        status="pending"
+        response={null}
+        kiroRejectWithFeedback={true}
+        {...kiroProps}
+      />,
+    );
+
+    // No textarea until the feedback action is chosen.
+    expect(screen.queryByTestId("kiro-command-feedback")).toBeNull();
+    fireEvent.click(screen.getByTestId("kiro-reject-with-feedback"));
+    fireEvent.change(screen.getByPlaceholderText(/what should kiro change/i), {
+      target: { value: "use printf instead" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /reject & send feedback/i }));
+
+    expect(submitSpy).toHaveBeenCalledWith("elic_kiro_reject", "decline", {
+      feedback: "use printf instead",
+    });
+  });
+
+  it("submits a plain decline when the feedback is left blank", () => {
+    // Whitespace-only feedback must not ship an empty ``feedback`` string —
+    // there's nothing to steer Kiro with, so it degrades to a plain decline.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+    render(
+      <ApprovalCard
+        elicitationId="elic_kiro_blank"
+        status="pending"
+        response={null}
+        kiroRejectWithFeedback={true}
+        {...kiroProps}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("kiro-reject-with-feedback"));
+    fireEvent.change(screen.getByPlaceholderText(/what should kiro change/i), {
+      target: { value: "   " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /reject & send feedback/i }));
+
+    expect(submitSpy).toHaveBeenCalledWith("elic_kiro_blank", "decline", undefined);
+  });
+
+  it("submits a plain decline from the one-click Reject button", () => {
+    // The hard "Reject" stays a one-click decline (no feedback) — the server
+    // interrupts the turn on that path.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+    render(
+      <ApprovalCard
+        elicitationId="elic_kiro_hard"
+        status="pending"
+        response={null}
+        kiroRejectWithFeedback={true}
+        {...kiroProps}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+
+    expect(submitSpy).toHaveBeenCalledWith("elic_kiro_hard", "decline", undefined);
+  });
+
+  it("echoes the rejection feedback on the responded pill", () => {
+    // The transcript should show WHY the command went back for revision.
+    render(
+      <ApprovalCard
+        elicitationId="elic_kiro_done"
+        status="responded"
+        response={{ action: "decline", content: { feedback: "use printf instead" } }}
+        kiroRejectWithFeedback={true}
+        {...kiroProps}
+      />,
+    );
+
+    expect(screen.getByTestId("plan-rejection-feedback").textContent).toContain(
+      "use printf instead",
+    );
+  });
+});

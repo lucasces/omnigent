@@ -1337,6 +1337,13 @@ def register_hooks_routes(
         # don't send it) are unaffected.
         if payload.get("kiro_trust_always") is True:
             extras["kiro_trust_always"] = True
+        # Stamped by the kiro-native mirror on classic (non-subagent) prompts,
+        # which support Kiro's own "No (Tab to edit)" → "Modify request" editor.
+        # Drives ApprovalCard's "Reject with feedback" affordance; other
+        # native producers (and Kiro's subagent prompts) don't send it and are
+        # unaffected.
+        if payload.get("kiro_reject_with_feedback") is True:
+            extras["kiro_reject_with_feedback"] = True
         # Turns this card into a multi-choice picker (ApprovalCard's existing
         # ``isMultiChoice`` branch, driven purely by ``requestedSchema`` — no
         # new UI needed). Currently only sent by the kiro-native mirror's
@@ -1377,9 +1384,24 @@ def register_hooks_routes(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
-        if result.action == "decline":
+        decline_feedback = (
+            result.content.get("feedback") if isinstance(result.content, dict) else None
+        )
+        declined_with_feedback = (
+            result.action == "decline"
+            and isinstance(decline_feedback, str)
+            and bool(decline_feedback.strip())
+        )
+        if result.action == "decline" and not declined_with_feedback:
             # Explicit user decline: interrupt the native harness before
             # returning the decline so the abort signal arrives first.
+            #
+            # A decline carrying revision feedback is the exception: the
+            # runner-side kiro mirror delivers it through Kiro's own "No (Tab to
+            # edit)" → "Modify request" editor, which rejects the tool and keeps
+            # the turn going. Interrupting would tear that live prompt down (and
+            # cancel the whole turn) before the keystrokes land, so skip it and
+            # let the mirror drive the native reject-with-feedback flow.
             await _forward_session_change_to_runner(
                 session_id,
                 get_server_runner_router(),
