@@ -513,6 +513,21 @@ def _kiro_permission_focus_on_reject(pane: str) -> bool:
     return any(line.strip().startswith("❯ No") for line in pane.splitlines())
 
 
+# Pressing Tab on the focused "No (Tab to edit)" row swaps the approve/reject
+# picker for Kiro's own "Modify request" editor — a free-text field
+# ("add your feedback...") whose submitted text rejects THIS tool call and
+# steers Kiro to revise it (the turn continues; the revised call re-prompts).
+# This marker sits on that editor's header ("<tool> requires approval ·
+# Modify request") and is absent from the plain picker, so it cleanly
+# distinguishes "the edit field is open" from "still on the picker".
+_KIRO_MODIFY_REQUEST_MARKER = "Modify request"
+
+
+def _kiro_permission_modify_request_active(pane: str) -> bool:
+    """Return whether Kiro's "Modify request" feedback editor is open."""
+    return _KIRO_MODIFY_REQUEST_MARKER in pane
+
+
 # Kiro V3 batches every pending subagent tool-call approval behind one
 # top-level picker ("N tool approvals pending from subagents", options
 # (a)/(f)/(c)/(x)) instead of showing each one modally like a non-subagent
@@ -1050,6 +1065,74 @@ def send_kiro_permission_verdict(
     )
     if not (_kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_reject(pane)):
         raise RuntimeError("kiro-native reject option was not safely focused before delivery")
+    time.sleep(_PERMISSION_ENTER_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+
+
+def send_kiro_permission_reject_with_feedback(
+    bridge_dir: Path,
+    *,
+    feedback: str,
+    has_trust_always_option: bool = True,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Reject the active Kiro permission prompt WITH revision feedback.
+
+    Delivers Kiro's own "No (Tab to edit)" → "Modify request" flow: focus the
+    reject row exactly as :func:`send_kiro_permission_verdict` does for a plain
+    decline (``has_trust_always_option`` controls how many rows "No" sits below
+    the default focus), then press ``Tab`` to open the free-text editor, paste
+    *feedback*, and submit. Kiro rejects this tool call and revises it toward
+    the feedback rather than cancelling the turn (the revised call re-prompts,
+    surfacing as a fresh elicitation on its own). Unlike a plain decline — which
+    the server delivers out-of-band via an interrupt (Escape) — this MUST reach
+    the live prompt by keystroke, so the caller must not also interrupt.
+
+    :raises RuntimeError: If the feedback is empty, the tmux target is stale,
+        the TUI has exited, the reject row is never safely focused, or Kiro's
+        "Modify request" editor never opens after ``Tab``.
+    """
+    if not feedback.strip():
+        raise RuntimeError("kiro-native reject-with-feedback requires non-empty feedback")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "kiro terminal is no longer running (the TUI exited); restart the session"
+        )
+    _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
+    # Focus "No" — same row math as the plain-decline branch of
+    # send_kiro_permission_verdict (see its comment on the 2-row vs 3-row menu).
+    down_presses = 2 if has_trust_always_option else 1
+    for _ in range(down_presses):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=_kiro_permission_focus_on_reject,
+        timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+    )
+    if not (_kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_reject(pane)):
+        raise RuntimeError("kiro-native reject option was not safely focused before delivery")
+    # Tab swaps the picker for the "Modify request" free-text editor.
+    time.sleep(_PERMISSION_ENTER_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Tab")
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _wait_for_focus(
+        socket_path,
+        tmux_target,
+        focus_check=_kiro_permission_modify_request_active,
+        timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+        prompt_active_check=_kiro_permission_modify_request_active,
+    )
+    if not _kiro_permission_modify_request_active(pane):
+        raise RuntimeError(
+            "kiro-native 'Modify request' editor did not open before feedback delivery"
+        )
+    _paste_literal_text(socket_path, tmux_target, bridge_dir, feedback)
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     time.sleep(_PERMISSION_KEY_INTERVAL_S)

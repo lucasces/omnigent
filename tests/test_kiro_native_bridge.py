@@ -19,6 +19,7 @@ from omnigent.harnesses.kiro_native.bridge import (
     build_kiro_native_terminal_env,
     inject_user_message,
     navigate_to_kiro_subagent_trust_scope,
+    send_kiro_permission_reject_with_feedback,
     send_kiro_permission_verdict,
     send_kiro_subagent_permission_verdict,
     write_forwarder_ready,
@@ -57,6 +58,18 @@ _PERMISSION_PANE_NO_TRUST_OPTION_REJECT_FOCUSED = _PERMISSION_PANE_NO_TRUST_OPTI
     "❯ Yes, single permission\n   No (Tab to edit)",
     "  Yes, single permission\n ❯ No (Tab to edit)",
 )
+# Pressing Tab on the focused "No (Tab to edit)" row swaps the picker for
+# Kiro's own free-text "Modify request" editor (captured verbatim from a live
+# kiro-cli 2.17.0 pane).
+_MODIFY_REQUEST_PANE = """
+────────────────────────────────────────────────────────────────────────────────
+↓ Shell pwd
+
+ shell requires approval · Modify request
+  add your feedback...
+────────────────────────────────────────────────────────────────────────────────
+ esc to close
+"""
 # Kiro V3 batches every pending subagent tool-call approval behind this
 # top-level picker instead of a modal prompt (see
 # _kiro_subagent_batch_prompt_active's docstring in kiro_native_bridge.py).
@@ -323,6 +336,97 @@ def test_send_kiro_permission_verdict_declines_with_slow_navigation(
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Down", "Down", "Enter"]
+
+
+def test_send_kiro_permission_reject_with_feedback_drives_modify_request_editor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Focus "No", Tab into the editor, paste feedback, submit — for a 3-row menu."""
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE,
+            _PERMISSION_PANE_REJECT_FOCUSED,
+            _MODIFY_REQUEST_PANE,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_permission_reject_with_feedback(
+        bridge_dir, feedback="use printf instead", timeout_s=0.1
+    )
+
+    # Nav to "No" (2 Downs on a 3-row menu), Tab into the editor, then Enter to
+    # submit — the feedback text itself rides a bracketed paste, never send-keys.
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Down", "Down", "Tab", "Enter"]
+    assert any("load-buffer" in call for call in calls)
+    assert any("paste-buffer" in call and "-p" in call for call in calls)
+    assert not any("-l" in call for call in calls)
+
+
+def test_send_kiro_permission_reject_with_feedback_sends_one_down_without_trust_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 2-row menu (no trust-always option) needs a single Down to reach "No"."""
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_NO_TRUST_OPTION,
+            _PERMISSION_PANE_NO_TRUST_OPTION_REJECT_FOCUSED,
+            _MODIFY_REQUEST_PANE,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_permission_reject_with_feedback(
+        bridge_dir, feedback="use printf", has_trust_always_option=False, timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Down", "Tab", "Enter"]
+
+
+def test_send_kiro_permission_reject_with_feedback_rejects_empty_feedback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty feedback is a programming error — the editor has nothing to submit."""
+    bridge_dir = tmp_path / "bridge"
+    _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    with pytest.raises(RuntimeError, match="non-empty feedback"):
+        send_kiro_permission_reject_with_feedback(bridge_dir, feedback="   ", timeout_s=0.1)
+
+
+def test_send_kiro_permission_reject_with_feedback_raises_if_editor_never_opens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Tab doesn't surface "Modify request", fail loudly instead of pasting into the void."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_FOCUS_RETRY_TIMEOUT_S", 0.01)
+    bridge_dir = tmp_path / "bridge"
+    # Tab never lands on the editor — the pane stays on the reject-focused picker.
+    _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE_REJECT_FOCUSED],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    with pytest.raises(RuntimeError, match="Modify request"):
+        send_kiro_permission_reject_with_feedback(bridge_dir, feedback="use printf", timeout_s=0.1)
 
 
 def test_send_kiro_permission_verdict_delivers_allow_always(

@@ -140,6 +140,7 @@ export type RenderItem =
       kiroCommand?: { command: string } | null;
       allowAllEdits?: boolean;
       kiroTrustAlways?: boolean;
+      kiroRejectWithFeedback?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
     };
@@ -1603,6 +1604,7 @@ function buildAssistantItems(
         kiroCommand: b.kiroCommand,
         allowAllEdits: b.allowAllEdits,
         kiroTrustAlways: b.kiroTrustAlways,
+        kiroRejectWithFeedback: b.kiroRejectWithFeedback,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
       });
