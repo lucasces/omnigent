@@ -296,7 +296,13 @@ class _QueueClient:
     ("response", "expected_action"),
     [
         pytest.param(httpx.Response(200, json={"action": "accept"}), "accept", id="accept"),
-        pytest.param(httpx.Response(200, json={"action": "decline"}), "decline", id="decline"),
+        # A classic-prompt decline delivers NOTHING via keystroke — the
+        # server-side interrupt (Escape) already refused the tool. Typing "No"
+        # on top would latch onto the next command's prompt (see the decline
+        # branch in _run_one_permission).
+        pytest.param(
+            httpx.Response(200, json={"action": "decline"}), "decline-noop", id="decline"
+        ),
         pytest.param(httpx.Response(200, json={"action": "cancel"}), "cancel", id="cancel"),
         pytest.param(
             httpx.Response(200, json={"action": "accept", "content": {"kiro_trust_always": True}}),
@@ -362,7 +368,11 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         # _permission_msg() always offers Kiro's "allow_always" option.
         "kiro_trust_always": True,
     }
-    if expected_action is None:
+    if expected_action in (None, "decline-noop"):
+        # None: the POST returned no usable action, so nothing is delivered.
+        # decline-noop: a classic decline intentionally delivers no keystroke
+        # (the interrupt already refused the tool) — the guard against the
+        # zombie-thread misfire.
         assert delivered == []
         assert trust_scope_navigations == []
     elif expected_action == "allow_always":

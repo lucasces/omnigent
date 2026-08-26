@@ -753,6 +753,13 @@ async def _run_one_permission(
                         subagent_name=subagent_name,
                         action=deliver_action,
                     )
+                # Subagent declines keep the keystroke path: the session-level
+                # Escape interrupt doesn't map to one subagent's row in AGENT
+                # MONITOR, and that path verifies the specific subagent is
+                # focused before typing (see _focus_kiro_subagent_prompt), so it
+                # can't bleed onto an unrelated prompt the way the classic
+                # decline did.
+                delivered_ok = True
             elif deliver_action == "allow_always":
                 await _deliver_allow_always(
                     client,
@@ -761,6 +768,27 @@ async def _run_one_permission(
                     permission=permission,
                     elicitation_id=elicitation_id,
                 )
+                delivered_ok = True
+            elif deliver_action == "decline":
+                # Do NOT type the "No" keystrokes for a classic-prompt decline.
+                # The server-side decline path already interrupted the turn
+                # (native_permission_request_hook sends ``{"type":"interrupt"}``
+                # -> Escape -> session/cancel), which refuses the tool AND tears
+                # down this exact prompt before we get here. The keystroke is
+                # therefore not just redundant — it is actively harmful: because
+                # the prompt is already gone, ``send_kiro_permission_verdict``'s
+                # ``_wait_for_kiro_permission_prompt`` blocks in a background
+                # thread (via ``asyncio.to_thread``) polling for *a* prompt, and
+                # asyncio task cancellation can't stop that OS thread. It
+                # survives, latches onto the NEXT command's prompt when it
+                # appears, and fires Down/Enter at it — silently rejecting an
+                # unrelated command in ~1.2s (its card shows "resolved
+                # elsewhere", never a real verdict). Escape and the keystroke
+                # both go through the same tmux send, so relying on the
+                # interrupt loses no delivery reliability. Leave ``delivered_ok``
+                # False so the finally frees the slot immediately; the
+                # interrupt's own ``cancelled`` response is the TUI-side signal.
+                pass
             else:
                 await asyncio.to_thread(
                     send_kiro_permission_verdict,
@@ -768,7 +796,7 @@ async def _run_one_permission(
                     action=deliver_action,
                     has_trust_always_option=permission.always_option_id is not None,
                 )
-            delivered_ok = True
+                delivered_ok = True
         except RuntimeError:
             _logger.exception(
                 "failed to deliver kiro permission verdict for %s; session=%s",
