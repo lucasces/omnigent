@@ -284,8 +284,22 @@ def _permission_result_request_id(message: dict[str, object]) -> str | None:
     outcome = result.get("outcome")
     if not isinstance(outcome, dict):
         return None
+    # A resolved prompt takes one of two shapes: a user selection carries a
+    # non-empty ``optionId`` (``{"outcome":"selected","optionId":...}``); a
+    # cancelled prompt — the turn was interrupted, including the Escape the
+    # server-side decline path sends — carries ``{"outcome":"cancelled"}`` with
+    # NO optionId. Both are terminal responses that must free this request's
+    # coordinator slot and cancel its pending delivery task. Keying only on
+    # ``optionId`` silently dropped the cancelled shape, leaking the slot: a
+    # later decline then blocked in ``wait_turn`` behind the dead slot and,
+    # when the queue finally advanced, fired its "No" keystrokes at whatever
+    # unrelated prompt was visible by then.
     option_id = outcome.get("optionId")
-    return request_id if isinstance(option_id, str) and option_id else None
+    if isinstance(option_id, str) and option_id:
+        return request_id
+    if outcome.get("outcome") == "cancelled":
+        return request_id
+    return None
 
 
 def _decode_acp_message(record: object) -> dict[str, object] | None:
@@ -761,20 +775,27 @@ async def _run_one_permission(
                 permission.request_id,
                 session_id,
             )
-            # The web UI already showed the approval and recorded a verdict —
-            # from the user's side this looked handled. Say plainly that the
-            # keystroke never reached the TUI, so "approved but nothing
-            # happened" doesn't read as ongoing processing.
-            await _post_external_assistant_notice(
-                client,
-                session_id=session_id,
-                text=(
-                    "⚠️ A aprovação para "
-                    f"`{permission.preview}` foi registrada, mas o Omnigent não "
-                    "conseguiu confirmar que o Kiro recebeu a decisão no terminal. "
-                    "Verifique a sessão — pode ser necessário aprovar manualmente."
-                ),
-            )
+            # A decline/cancel is ALSO delivered out-of-band by the server-side
+            # interrupt (on an explicit decline the native permission hook
+            # sends ``{"type":"interrupt"}`` -> Escape -> session/cancel), which
+            # normally resolves the prompt before this keystroke path even runs.
+            # So a keystroke-delivery failure on a decline is the expected,
+            # benign case — the tool was already refused — not a stuck session.
+            # Only a failed *approval* ("yes" verdict) means an action the user
+            # OK'd never happened, which is what this notice is for. Posting it
+            # on a decline was a false alarm: it read "A aprovação ... foi
+            # registrada" on a prompt the user had actually rejected.
+            if deliver_action in {"accept", "allow_always"}:
+                await _post_external_assistant_notice(
+                    client,
+                    session_id=session_id,
+                    text=(
+                        "⚠️ A aprovação para "
+                        f"`{permission.preview}` foi registrada, mas o Omnigent não "
+                        "conseguiu confirmar que o Kiro recebeu a decisão no terminal. "
+                        "Verifique a sessão — pode ser necessário aprovar manualmente."
+                    ),
+                )
     finally:
         if delivered_ok:
             # Kiro's own ACP "response" event is the real release signal
