@@ -50,6 +50,19 @@ def _permission_result_msg(request_id: str = "req-1", option_id: str = "allow_on
     }
 
 
+def _permission_cancelled_msg(request_id: str = "req-1") -> dict:
+    """A prompt resolved by cancellation (turn interrupted / declined-via-interrupt).
+
+    Kiro reports this as ``{"outcome":"cancelled"}`` with no ``optionId`` —
+    distinct from a user selection, but still a terminal response.
+    """
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"outcome": {"outcome": "cancelled"}},
+    }
+
+
 def _record(message: dict, *, direction: str = "out") -> dict:
     return {"ts": "2026-06-25T00:00:00Z", "dir": direction, "msg": json.dumps(message)}
 
@@ -169,8 +182,39 @@ def test_parse_permission_request_returns_none_for_unsupported_shapes(message: d
 
 def test_permission_result_request_id_extraction() -> None:
     assert knp._permission_result_request_id(_permission_result_msg("req-9")) == "req-9"
+    # A cancelled prompt has no optionId but is still a terminal response that
+    # must free the request's coordinator slot — see the leak it otherwise
+    # caused in _permission_result_request_id's comment.
+    assert knp._permission_result_request_id(_permission_cancelled_msg("req-9")) == "req-9"
     assert knp._permission_result_request_id({"id": "req-9", "result": {}}) is None
+    # An empty outcome dict is neither a selection nor a cancellation.
     assert knp._permission_result_request_id({"id": 1, "result": {"outcome": {}}}) is None
+    assert (
+        knp._permission_result_request_id(
+            {"id": "req-9", "result": {"outcome": {"outcome": "selected"}}}
+        )
+        is None
+    )
+
+
+def test_read_new_permission_events_recognizes_cancelled_response(tmp_path: Path) -> None:
+    """A cancelled outcome is parsed as a 'response' event, not silently dropped.
+
+    Regression guard for the coordinator-slot leak: keying the response parse
+    on ``optionId`` alone dropped the cancelled shape, so the mirror never
+    released the request's slot on a decline-via-interrupt.
+    """
+    record_file = tmp_path / "kiro_acp_record.jsonl"
+    record_file.write_bytes(
+        _record_bytes(_permission_msg("req-1")) + _record_bytes(_permission_cancelled_msg("req-1"))
+    )
+
+    events, _names, _offset = knp._read_new_permission_events(record_file, 0)
+
+    assert [(event.kind, event.request_id) for event in events] == [
+        ("request", "req-1"),
+        ("response", "req-1"),
+    ]
 
 
 def test_elicitation_id_is_deterministic_and_session_scoped() -> None:
@@ -329,6 +373,60 @@ async def test_run_one_permission_posts_then_delivers_verdict(
     else:
         assert delivered == [(tmp_path, expected_action)]
         assert trust_scope_navigations == []
+
+
+@pytest.mark.parametrize(
+    ("action", "expects_notice"),
+    [
+        # A failed *approval* means an action the user OK'd never reached the
+        # TUI — the notice must fire so the stall is visible.
+        pytest.param("accept", True, id="accept-notices"),
+        # A failed decline is benign: the server-side interrupt (Escape ->
+        # session/cancel) already refused the tool, so the keystroke failing is
+        # the expected race, not a stuck session. No false "aprovação
+        # registrada" notice.
+        pytest.param("decline", False, id="decline-silent"),
+        pytest.param("cancel", False, id="cancel-silent"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_one_permission_delivery_failure_notice_only_for_approvals(
+    action: str,
+    expects_notice: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_send(bridge_dir: Path, *, action: str, **_kw: object) -> None:
+        raise RuntimeError("kiro-native prompt was not focused before delivery")
+
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _raise_send)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    # [verdict, (notice)] — the notice POST is only consumed when it fires.
+    client = _QueueClient([httpx.Response(200, json={"action": action}), httpx.Response(200)])
+    coordinator = knp._DeliveryCoordinator()
+    coordinator.register("req-1")
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        coordinator=coordinator,
+        subagent_names={},
+    )
+
+    notice_posts = [
+        body
+        for url, body in client.posts
+        if url == "/v1/sessions/conv_1/events" and body.get("type") == "external_assistant_message"
+    ]
+    if expects_notice:
+        assert len(notice_posts) == 1
+        assert "não" in notice_posts[0]["data"]["text"]
+    else:
+        assert notice_posts == []
 
 
 @pytest.mark.asyncio
