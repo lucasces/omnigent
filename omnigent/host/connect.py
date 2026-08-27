@@ -157,6 +157,21 @@ from omnigent.version import VERSION
 _logger = logging.getLogger(__name__)
 
 
+# Scratch sessions launch in a throwaway directory the user never has to pick.
+# Their workspace is any path under this base; the host creates it on demand at
+# launch instead of failing "workspace missing" like a normal project dir.
+SCRATCH_WORKSPACE_BASE = Path.home() / ".agents" / "scratches"
+
+
+def _is_scratch_workspace(workspace: Path) -> bool:
+    """True when ``workspace`` lives under the per-user scratch base."""
+    try:
+        workspace.relative_to(SCRATCH_WORKSPACE_BASE)
+    except ValueError:
+        return False
+    return True
+
+
 class _WaitidInfo(Protocol):
     si_pid: int
 
@@ -1715,11 +1730,24 @@ class HostProcess:
 
         workspace = Path(frame.workspace).expanduser()
         if not workspace.is_dir():
-            return self._launch_failed(
-                frame,
-                workspace_missing_message(workspace),
-                error_code=WORKSPACE_MISSING_ERROR_CODE,
-            )
+            # Scratch sessions name a directory that doesn't exist yet — create
+            # it on demand instead of refusing. Bounded to the scratch base so a
+            # typo'd project path still fails loudly.
+            if _is_scratch_workspace(workspace):
+                try:
+                    workspace.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    return self._launch_failed(
+                        frame,
+                        f"could not create scratch workspace {workspace}: {exc}",
+                        error_code=WORKSPACE_MISSING_ERROR_CODE,
+                    )
+            else:
+                return self._launch_failed(
+                    frame,
+                    workspace_missing_message(workspace),
+                    error_code=WORKSPACE_MISSING_ERROR_CODE,
+                )
 
         runner_id = token_bound_runner_id(frame.binding_token)
         initial_auth_token = await asyncio.to_thread(

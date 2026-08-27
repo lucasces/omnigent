@@ -2379,6 +2379,44 @@ describe("NewChatLandingScreen", () => {
     expect(body.git?.base_branch).toBeUndefined();
   });
 
+  it("starts a scratch session in a generated throwaway dir under the host home", async () => {
+    // Home resolves to /Users/corey so the scratch path can be composed as an
+    // absolute path the server accepts.
+    useHostFilesystemMock.mockReturnValue({
+      data: { entries: [fsEntry("/Users/corey/repo")] },
+      isLoading: false,
+      error: null,
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    // Pick the scratch option from the working-directory popover.
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-scratch-option"));
+
+    // The chip now reads "Scratch" and the git worktree chip is gone.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "Scratch",
+      ),
+    );
+    expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+
+    const { body } = await submitAndReadBody("scratch some ideas");
+    expect(body.host_id).toBe("host_1");
+    // Generated under <home>/.agents/scratches/<8-hex-id>.
+    expect(body.workspace).toMatch(/^\/Users\/corey\/\.agents\/scratches\/[0-9a-f]{8}$/);
+    // A scratch dir isn't a git repo — no worktree opts ride along.
+    expect(body.git).toBeUndefined();
+  });
+
   it("creates a new worktree when the prefilled branch name is edited", async () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
