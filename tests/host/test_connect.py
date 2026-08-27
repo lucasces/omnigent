@@ -475,6 +475,52 @@ async def test_handle_launch_fails_for_bad_workspace() -> None:
     assert result.runner_id is None
 
 
+async def test_handle_launch_creates_missing_scratch_workspace(
+    tmp_path: Path,
+) -> None:
+    """
+    A scratch workspace under the scratch base is created on demand rather
+    than refused: the user never has to pre-create the throwaway directory.
+
+    If it fails with workspace_missing, scratch sessions can't start.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    scratch_base = tmp_path / "scratches"
+    workspace = scratch_base / "deadbeef"
+    assert not workspace.exists()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_scratch",
+        binding_token="scratch_token",
+        workspace=str(workspace),
+    )
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "10"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with (
+        patch("omnigent.host.connect.SCRATCH_WORKSPACE_BASE", scratch_base),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+    ):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "launched", (
+        f"Scratch workspace should be created and launched, got {result.status!r}: {result.error}"
+    )
+    assert workspace.is_dir(), "Scratch workspace directory should have been created"
+
+    _cleanup_host(host)
+
+
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

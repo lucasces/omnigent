@@ -26,6 +26,7 @@ import {
   PlusIcon,
   SettingsIcon,
   ShuffleIcon,
+  SparklesIcon,
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
@@ -2077,6 +2078,7 @@ interface LandingDraft {
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
+  scratchSelected: boolean;
   branchName: string;
   prefilledBranch: string;
   permissionMode: string;
@@ -2385,6 +2387,17 @@ export function NewChatLandingScreen() {
     () => landingDraft?.sandboxRepoBranch ?? "",
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
+  // Scratch session: run in a throwaway directory under
+  // `<host-home>/.agents/scratches/<id>` instead of picking a project. The host
+  // creates the directory on demand at launch (see `_is_scratch_workspace`).
+  const [scratchSelected, setScratchSelected] = useState<boolean>(
+    () => landingDraft?.scratchSelected ?? false,
+  );
+  // Stable per-session id so the composed scratch path doesn't churn across
+  // renders while the option stays selected. Re-rolled on each fresh pick.
+  const [scratchId, setScratchId] = useState<string>(() =>
+    crypto.randomUUID().replace(/-/g, "").slice(0, 8),
+  );
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -2516,6 +2529,7 @@ export function NewChatLandingScreen() {
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
+    scratchSelected,
     branchName,
     prefilledBranch,
     permissionMode,
@@ -2661,6 +2675,7 @@ export function NewChatLandingScreen() {
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
+    setScratchSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     setWorkspace("");
@@ -2764,6 +2779,28 @@ export function NewChatLandingScreen() {
     () => (homeListingIsPlaceholder ? null : deriveHomeDir(homeListing?.entries ?? [])),
     [homeListing, homeListingIsPlaceholder],
   );
+
+  // Scratch needs the host's absolute home to compose its path, but `derivedHome`
+  // only lists home when there are no recents. Fetch home explicitly while the
+  // scratch option is active so the path resolves regardless of recents.
+  const { data: scratchHomeListing, isPlaceholderData: scratchHomePlaceholder } = useHostFilesystem(
+    selectedHostId,
+    scratchSelected ? "" : null,
+  );
+  const scratchHome = useMemo(
+    () =>
+      scratchSelected
+        ? (derivedHome ??
+          (scratchHomePlaceholder ? null : deriveHomeDir(scratchHomeListing?.entries ?? [])))
+        : null,
+    [scratchSelected, derivedHome, scratchHomeListing, scratchHomePlaceholder],
+  );
+  // Absolute scratch workspace, or "" while home is still resolving. The server
+  // requires an absolute path, so this must wait for `scratchHome`.
+  const scratchWorkspace =
+    scratchSelected && scratchHome
+      ? `${scratchHome.replace(/\/+$/, "")}/.agents/scratches/${scratchId}`
+      : "";
 
   // Fill the branch field with a unique auto-generated name so the user can
   // spin up a throwaway worktree without inventing one. crypto.randomUUID is
@@ -3363,7 +3400,8 @@ export function NewChatLandingScreen() {
   // Existing git worktrees of the picked directory's repo, for the
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
-  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const worktreesEnabled =
+    !sandboxSelected && !scratchSelected && selectedHostId !== null && workspaceTrimmed !== "";
   const { data: hostWorktrees, isPlaceholderData: hostWorktreesArePlaceholder } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
@@ -3666,7 +3704,9 @@ export function NewChatLandingScreen() {
   const canSubmit =
     message.trim().length > 0 &&
     selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : !!selectedHostId && workspaceValid) &&
+    (sandboxSelected
+      ? sandboxRepoValid
+      : !!selectedHostId && (scratchSelected ? scratchWorkspace !== "" : workspaceValid)) &&
     !creating;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
@@ -3677,16 +3717,20 @@ export function NewChatLandingScreen() {
     ? null
     : sandboxSelected && !sandboxRepoValid
       ? "Please enter a valid repository URL"
-      : !sandboxSelected && (!selectedHostId || !workspaceValid)
-        ? "Please choose a host and working directory"
-        : message.trim().length === 0
-          ? "Enter a message to get started"
-          : null;
+      : !sandboxSelected && scratchSelected && !!selectedHostId && scratchWorkspace === ""
+        ? "Preparing scratch directory…"
+        : !sandboxSelected && (!selectedHostId || (!scratchSelected && !workspaceValid))
+          ? "Please choose a host and working directory"
+          : message.trim().length === 0
+            ? "Enter a message to get started"
+            : null;
 
   // Chip display labels.
-  const workspaceLabel = workspaceTrimmed
-    ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
-    : "Working directory";
+  const workspaceLabel = scratchSelected
+    ? "Scratch"
+    : workspaceTrimmed
+      ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
+      : "Working directory";
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
     sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
@@ -3818,9 +3862,29 @@ export function NewChatLandingScreen() {
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
     setSandboxSelected(true);
+    setScratchSelected(false);
     setSelectedHostId(null);
     setWorkspace("");
     seededHostRef.current = null;
+  }
+
+  // Switch the working directory to a fresh scratch dir on the current host —
+  // no project to pick. Re-rolls the id so each pick is its own directory.
+  function selectScratch() {
+    setSandboxSelected(false);
+    setScratchSelected(true);
+    setScratchId(crypto.randomUUID().replace(/-/g, "").slice(0, 8));
+    // Clear any typed project path + worktree branch: a scratch dir isn't a
+    // git repo, so neither applies.
+    setWorkspace("");
+    setBranchName("");
+    setWorkspacePopoverOpen(false);
+  }
+
+  // Leaving scratch for a real directory the user browsed to.
+  function selectWorkspaceDir(path: string) {
+    setScratchSelected(false);
+    setWorkspace(path);
   }
 
   // Connect THIS desktop machine as a host for the current server, then select
@@ -3883,6 +3947,10 @@ export function NewChatLandingScreen() {
     // draft back via returnDraftToUser.
     submittedRef.current = true;
     try {
+      // Scratch sessions send their generated throwaway path; every other path
+      // sends the picked directory. `canSubmit` already guarantees the scratch
+      // path has resolved (non-empty) before we get here.
+      const submitWorkspace = scratchSelected ? scratchWorkspace : workspaceTrimmed;
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
@@ -3966,7 +4034,7 @@ export function NewChatLandingScreen() {
         // same way the fork-resume path does.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = {};
-        if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
+        if (submitWorkspace) metadata.workspace = submitWorkspace;
         // Born-filed: stamp the project's `omni_project` label so a bundled
         // session groups under its project from its first sidebar appearance,
         // same as the JSON path (see `createLabels`).
@@ -3977,7 +4045,7 @@ export function NewChatLandingScreen() {
         );
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
-        if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
+        if (!sandboxSelected && selectedHostId && submitWorkspace) {
           // Create a new worktree, bind an existing one (records the branch
           // for the sidebar + delete flow without creating anything), or
           // neither — mirrored on the `git` block.
@@ -3986,7 +4054,7 @@ export function NewChatLandingScreen() {
             : startInExistingWorktree
               ? { branchName: trimmedBranch, existingWorktree: true }
               : undefined;
-          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
+          await launchRunner(selectedHostId, data.id, submitWorkspace, gitOpts);
         }
         // Clear pending agent after successful creation.
         setPendingAgent(null);
@@ -4032,7 +4100,7 @@ export function NewChatLandingScreen() {
                 }
               : {
                   host_id: selectedHostId,
-                  workspace: workspaceTrimmed,
+                  workspace: submitWorkspace,
                   // Create a new worktree, or bind an existing one
                   // (`existing_worktree` records the branch for the sidebar +
                   // delete flow without creating anything), or neither.
@@ -4183,7 +4251,8 @@ export function NewChatLandingScreen() {
         }
       }
       // Sandbox creates have no user-picked workspace to remember.
-      if (!sandboxSelected) addRecent(workspaceTrimmed);
+      // Scratch dirs are throwaway — don't clutter the recent list with them.
+      if (!sandboxSelected && !scratchSelected) addRecent(workspaceTrimmed);
       // Remember the launched harness so the picker promotes it out of "More"
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
@@ -5026,23 +5095,41 @@ export function NewChatLandingScreen() {
                   narrow screen; desktop still gets the full width. */}
                   <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
                     {selectedHostId ? (
-                      <WorkspacePicker
-                        hostId={selectedHostId}
-                        initialPath={
-                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
-                        }
-                        onNavigate={setWorkspace}
-                        // Warn when browsing into a directory other live agents
-                        // occupy. Suppressed only when a NEW isolated worktree
-                        // will be created (no shared-dir conflict then). When
-                        // starting directly in an existing worktree the branch
-                        // is prefilled but the dir IS shared, so keep warning.
-                        occupancyForPath={
-                          !shouldCreateWorktree
-                            ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
-                            : undefined
-                        }
-                      />
+                      <>
+                        {/* Scratch session: a throwaway dir the host creates on
+                          demand — no project to pick. Browsing to a real dir
+                          below switches back off scratch. */}
+                        <button
+                          type="button"
+                          onClick={selectScratch}
+                          data-active={scratchSelected ? "true" : undefined}
+                          className="flex w-full items-center gap-2 border-b border-border px-3 py-2 text-left text-sm text-muted-foreground transition hover:bg-muted hover:text-foreground data-[active=true]:bg-muted data-[active=true]:text-foreground dark:hover:bg-muted/50"
+                          data-testid="new-chat-landing-scratch-option"
+                        >
+                          <SparklesIcon className="size-4 shrink-0" />
+                          <span className="flex-1">Scratch session</span>
+                          <span className="text-xs text-muted-foreground/70">
+                            fresh throwaway dir
+                          </span>
+                        </button>
+                        <WorkspacePicker
+                          hostId={selectedHostId}
+                          initialPath={
+                            isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
+                          }
+                          onNavigate={selectWorkspaceDir}
+                          // Warn when browsing into a directory other live agents
+                          // occupy. Suppressed only when a NEW isolated worktree
+                          // will be created (no shared-dir conflict then). When
+                          // starting directly in an existing worktree the branch
+                          // is prefilled but the dir IS shared, so keep warning.
+                          occupancyForPath={
+                            !shouldCreateWorktree
+                              ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
+                              : undefined
+                          }
+                        />
+                      </>
                     ) : (
                       <p className="p-3 text-sm text-muted-foreground">Select a host first.</p>
                     )}
@@ -5051,8 +5138,9 @@ export function NewChatLandingScreen() {
               )}
 
               {/* Git worktree chip — hidden for sandbox sessions (worktree
-                creation requires a caller-supplied host_id). */}
-              {!sandboxSelected && (
+                creation requires a caller-supplied host_id) and for scratch
+                sessions (a throwaway dir isn't a git repo). */}
+              {!sandboxSelected && !scratchSelected && (
                 <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                   <PopoverTrigger asChild>
                     <button
