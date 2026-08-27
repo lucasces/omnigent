@@ -212,7 +212,11 @@ import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
-import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import {
+  createHostDirectory,
+  useHostFilesystem,
+  type HostFilesystemEntry,
+} from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -4472,6 +4476,21 @@ export function NewChatLandingScreen() {
       // sends the picked directory. `canSubmit` already guarantees the scratch
       // path has resolved (non-empty) before we get here.
       const submitWorkspace = scratchSelected ? scratchWorkspace : workspaceTrimmed;
+      // The server validates the workspace exists on the host before launching,
+      // so a scratch dir must be created up front — the host-side launch also
+      // creates it (a net for relaunches), but that runs too late for this
+      // pre-launch stat. A fresh id means it never pre-exists.
+      if (scratchSelected && selectedHostId) {
+        try {
+          await createHostDirectory(selectedHostId, submitWorkspace);
+        } catch (err) {
+          returnDraftToUser();
+          setCreateError(
+            `Could not create scratch directory: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return;
+        }
+      }
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting

@@ -40,7 +40,11 @@ import {
   type Host,
 } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
-import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import {
+  createHostDirectory,
+  useHostFilesystem,
+  type HostFilesystemEntry,
+} from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -105,6 +109,9 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // WorkspacePicker (rendered by the file browser) reads this on mount;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  // Scratch sessions create their throwaway dir on the host before the create
+  // POST; default to echoing the requested path.
+  createHostDirectory: vi.fn(async (_hostId: string, path: string) => path),
 }));
 // Mocked so it doesn't hit authenticatedFetch (which would pollute the
 // call list the create-flow assertions index into positionally).
@@ -218,6 +225,7 @@ const CODEX_MODEL_OPTIONS_RESULT = {
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const createHostDirectoryMock = vi.mocked(createHostDirectory);
 const useHostWorktreesMock = vi.mocked(useHostWorktrees);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
@@ -2388,6 +2396,9 @@ describe("NewChatLandingScreen", () => {
       error: null,
       isPlaceholderData: false,
     } as unknown as ReturnType<typeof useHostFilesystem>);
+    // The scratch dir is created on the host (via createHostDirectory) before
+    // the create POST, since the server stats the workspace pre-launch.
+    createHostDirectoryMock.mockClear();
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -2415,6 +2426,10 @@ describe("NewChatLandingScreen", () => {
     expect(body.workspace).toMatch(/^\/Users\/corey\/\.agents\/scratches\/[0-9a-f]{8}$/);
     // A scratch dir isn't a git repo — no worktree opts ride along.
     expect(body.git).toBeUndefined();
+
+    // The scratch dir was created on the host before the session POST, at the
+    // same path the create body carries.
+    expect(createHostDirectoryMock).toHaveBeenCalledWith("host_1", body.workspace);
   });
 
   it("creates a new worktree when the prefilled branch name is edited", async () => {
