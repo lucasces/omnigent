@@ -42,6 +42,13 @@ import {
   XIcon,
 } from "lucide-react";
 import { useState } from "react";
+import {
+  CodeBlock,
+  CodeBlockActions,
+  CodeBlockCopyButton,
+  CodeBlockHeader,
+  CodeBlockTitle,
+} from "@/components/ai-elements/code-block";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -85,6 +92,27 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
   const enumValues = (answer as Record<string, unknown>).enum;
   if (!Array.isArray(enumValues)) return [];
   return enumValues.filter((v): v is string => typeof v === "string" && v.length > 0);
+}
+
+/**
+ * Syntax-highlighted, scrollable render of a Codex/Kiro approval command.
+ * Replaces a bare `<pre>` dump so multi-line shell scripts are actually
+ * readable (bash highlighting + line wrapping) instead of a JSON-ish wall
+ * of text truncated by card width.
+ */
+function CommandBlock({ command }: { command: string }) {
+  return (
+    <CodeBlock code={command} language="bash" className="max-h-64 overflow-y-auto">
+      <CodeBlockHeader>
+        <CodeBlockTitle className="min-w-0">
+          <span className="truncate font-medium uppercase tracking-wide">Command</span>
+        </CodeBlockTitle>
+        <CodeBlockActions>
+          <CodeBlockCopyButton className="size-6" />
+        </CodeBlockActions>
+      </CodeBlockHeader>
+    </CodeBlock>
+  );
 }
 
 /**
@@ -579,9 +607,7 @@ export function ApprovalCard({
             {isCodexCommandApproval ? (
               <>
                 {codexCommand.reason && <span>{codexCommand.reason}</span>}
-                <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap">
-                  {codexCommand.command}
-                </pre>
+                <CommandBlock command={codexCommand.command} />
                 {codexCommand.cwd && (
                   <span>
                     <span className="text-muted-foreground">cwd: </span>
@@ -592,9 +618,7 @@ export function ApprovalCard({
                 )}
               </>
             ) : isKiroCommandApproval ? (
-              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
-                {kiroCommand.command}
-              </pre>
+              <CommandBlock command={kiroCommand.command} />
             ) : showGatingMessage ? (
               <span>{message}</span>
             ) : null}
@@ -673,9 +697,7 @@ export function ApprovalCard({
           <>
             <span>Codex wants to run this command.</span>
             {codexCommand.reason && <span className="text-foreground">{codexCommand.reason}</span>}
-            <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap">
-              {codexCommand.command}
-            </pre>
+            <CommandBlock command={codexCommand.command} />
             {codexCommand.cwd && (
               <span className="text-sm">
                 cwd:{" "}
@@ -687,9 +709,7 @@ export function ApprovalCard({
         ) : isKiroCommandApproval ? (
           <>
             <span>Kiro wants to run this command.</span>
-            <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap break-words">
-              {kiroCommand.command}
-            </pre>
+            <CommandBlock command={kiroCommand.command} />
             {kiroRejectWithFeedback ? (
               <KiroCommandActions
                 allowTrustAlways={kiroTrustAlways === true}

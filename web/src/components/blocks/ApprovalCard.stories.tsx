@@ -61,6 +61,27 @@ export const CodexCommand: Story = {
   },
 };
 
+export const KiroCommand: Story = {
+  args: {
+    message: "Kiro wants to run this command.",
+    phase: "kiro_native_permission",
+    policyName: "kiro_native_permission",
+    contentPreview: "",
+    kiroCommand: {
+      command: [
+        "export KUBECONFIG=/home/user/.kube/config-staging",
+        'echo "=== checking pods in ns staging ==="',
+        "eval $(aws-sso eval --sso example-org --account 111111111111 --role ReadOnly 2>/dev/null)",
+        "for ns in staging production; do",
+        '  kubectl get pods -n "$ns" --field-selector=status.phase!=Running',
+        "done",
+      ].join("\n"),
+    },
+    kiroRejectWithFeedback: true,
+    kiroTrustAlways: true,
+  },
+};
+
 export const SubmittedAnswers: Story = {
   args: {
     message: "Claude asked how the visual tests should run.",
