@@ -106,6 +106,42 @@ def test_parse_permission_request_leaves_always_option_none_when_absent() -> Non
     assert req.always_option_id is None
 
 
+def test_parse_permission_request_extracts_full_command_from_trust_options() -> None:
+    msg = _permission_msg("req-1")
+    msg["params"]["toolCall"]["title"] = "Running: bash -lc '...truncated by kiro..."
+    msg["params"]["_meta"] = {
+        "trustOptions": [
+            {
+                "label": "Full command",
+                "display": "bash -lc 'echo one\necho two\necho THIS_IS_THE_FULL_COMMAND'",
+                "setting_key": "allowedCommands",
+                "patterns": ["bash( .*)?"],
+            },
+            {"label": "Base command", "display": "bash *", "setting_key": "allowedCommands"},
+        ]
+    }
+
+    req = parse_permission_request(msg)
+
+    assert req is not None
+    assert req.full_command == "bash -lc 'echo one\necho two\necho THIS_IS_THE_FULL_COMMAND'"
+    # Kiro's own trust submenu can't afford to truncate the command it
+    # builds an allow-pattern from, so the untruncated row wins over the
+    # (possibly cut) title in both the payload command and the preview.
+    assert req.preview == req.full_command
+
+
+def test_parse_permission_request_falls_back_to_title_without_full_command_row() -> None:
+    msg = _permission_msg("req-1")
+    msg["params"]["_meta"] = {"trustOptions": [{"label": "Base command", "display": "bash *"}]}
+
+    req = parse_permission_request(msg)
+
+    assert req is not None
+    assert req.full_command is None
+    assert req.preview == req.title
+
+
 def test_parse_permission_request_captures_subagent_session_id() -> None:
     req = parse_permission_request(_permission_msg("req-1"))
 

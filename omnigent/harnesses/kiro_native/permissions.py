@@ -59,6 +59,15 @@ class KiroPermissionRequest:
     title: str
     accept_option_id: str
     decline_option_id: str
+    # Kiro truncates ``title`` (with a trailing "...") once the command runs
+    # long or multi-line, since it doubles as the TUI's one-line prompt
+    # label. The same request's ``params._meta.trustOptions`` carries an
+    # untruncated copy under the "Full command" label — Kiro's own trust
+    # submenu needs the real command to build an allow-pattern from, so it
+    # can't be capped. ``None`` when Kiro omits ``_meta`` (older builds) or
+    # the "Full command" row (non-command prompt kinds, e.g. file edits),
+    # in which case callers fall back to ``title``.
+    full_command: str | None = None
     # Kiro's TUI offers a third "Trust, always allow in this session" option
     # alongside the one-time allow/decline pair on (in practice) every
     # permission prompt. Optional rather than required so a future Kiro build
@@ -78,7 +87,7 @@ class KiroPermissionRequest:
 
     @property
     def preview(self) -> str:
-        return self.title[:_PREVIEW_MAX]
+        return (self.full_command or self.title)[:_PREVIEW_MAX]
 
 
 @dataclass(frozen=True)
@@ -183,6 +192,32 @@ def _spawn_coordinator_watchdog(coordinator: _DeliveryCoordinator, request_id: s
     task.add_done_callback(_watchdog_tasks.discard)
 
 
+def _extract_full_command(params: dict[str, object]) -> str | None:
+    """Return Kiro's untruncated command from ``params._meta.trustOptions``.
+
+    Kiro's trust submenu ships a "Full command" row (alongside "Base
+    command", "Entire tool", etc.) whose ``display`` is the real command
+    verbatim — it has to be, since Kiro builds an allow-pattern from it.
+    ``title`` is a display label capped for the TUI's one-line prompt and
+    doesn't have that constraint, so it truncates instead.
+    """
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    trust_options = meta.get("trustOptions")
+    if not isinstance(trust_options, list):
+        return None
+    for option in trust_options:
+        if not isinstance(option, dict):
+            continue
+        if option.get("label") != "Full command":
+            continue
+        display = option.get("display")
+        if isinstance(display, str) and display.strip():
+            return display
+    return None
+
+
 def parse_permission_request(message: dict[str, object]) -> KiroPermissionRequest | None:
     """Parse a Kiro ACP ``session/request_permission`` message."""
     if message.get("method") != "session/request_permission":
@@ -231,6 +266,7 @@ def parse_permission_request(message: dict[str, object]) -> KiroPermissionReques
         accept_option_id=accept_option_id,
         decline_option_id=decline_option_id,
         always_option_id=always_option_id,
+        full_command=_extract_full_command(params),
         subagent_session_id=(
             subagent_session_id
             if isinstance(subagent_session_id, str) and subagent_session_id
@@ -641,16 +677,19 @@ async def _run_one_permission(
             "operation_type": "tool",
             "message": f"Kiro wants approval for {permission.preview}",
             "content_preview": permission.preview,
-            # Untruncated: Kiro's ACP tool_call title is often the full
-            # shell command, and the 1024-char content_preview cap
-            # (shared by every native-permission producer, see
-            # ``_PREVIEW_MAX``) was silently cutting long commands off
-            # in the approval dialog before a human ever saw the rest.
-            # The web UI renders this separately, in a scrollable block
-            # that isn't subject to that cap (see ApprovalCard's
+            # Untruncated: prefer the "Full command" row Kiro ships on
+            # ``_meta.trustOptions`` (see ``_extract_full_command``) — unlike
+            # ``title``, which Kiro itself truncates once the command runs
+            # long or multi-line, this can't be capped since Kiro's own trust
+            # submenu builds an allow-pattern from it. Also bypasses the
+            # 1024-char content_preview cap (shared by every native-permission
+            # producer, see ``_PREVIEW_MAX``), which was separately cutting
+            # long commands off in the approval dialog before a human ever
+            # saw the rest. The web UI renders this in a scrollable block
+            # that isn't subject to either cap (see ApprovalCard's
             # ``kiroCommand`` branch) — same technique
             # ``_codex_command_approval_params`` uses for Codex.
-            "command": permission.title,
+            "command": permission.full_command or permission.title,
         }
         # Tells the server this prompt also has Kiro's "Trust, always allow
         # in this session" option, so the web card can grow the third
