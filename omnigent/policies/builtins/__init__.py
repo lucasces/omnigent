@@ -40,6 +40,7 @@ BUILTIN_POLICY_MODULES = [
     "omnigent.policies.builtins.google",
     "omnigent.policies.builtins.github",
     "omnigent.policies.builtins.working_dir",
+    "omnigent.policies.builtins.shell_readonly",
     "omnigent.policies.builtins.risk_score",
     "omnigent.policies.builtins.routing",
     "omnigent.policies.builtins.cel",
