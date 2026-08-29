@@ -1,0 +1,113 @@
+# Curated read-only shell command presets for
+# omnigent.policies.builtins.shell_readonly.allow_read_only_shell.
+#
+# Each preset is a list of command patterns; each pattern is a list of
+# literal tokens matched as a prefix against the real (wrapper-stripped)
+# invocation, e.g. [git, status] matches `git status -s` but not `git stash`.
+#
+# Ported from, and deliberately narrower than, xtga/agtx's
+# permissions/*.toml presets: only commands that cannot mutate the
+# filesystem, mutate the network, or execute arbitrary code are included.
+# Excluded on purpose, even where agtx allows them:
+#   - core: find, sed, awk (can execute via -exec / -i / system()); rm, mv,
+#     cp, mkdir (mutate the filesystem)
+#   - git: add, commit, push, merge, checkout, stash, branch (all mutate
+#     the repo or working tree; `branch` can delete/rename with -d/-D/-m)
+#   - node: bare `node` (runs arbitrary scripts), npm/yarn install/run/build
+#     (install or run arbitrary package scripts)
+#   - python: pip install, python -m black (rewrites files without --check)
+#   - rust: cargo build (writes build artifacts + fetches deps), cargo fmt
+#     (rewrites files without --check)
+#   - docker/k8s: build, run, compose, apply, delete (create/mutate resources)
+#   - nix: nix build (writes the store), nixos-rebuild (mutates the system)
+#   - terraform: init (fetches providers/modules), apply/destroy/import
+#     (mutate real infrastructure), fmt (rewrites files without -check),
+#     state mv/rm/push, taint/untaint, workspace new/delete
+
+core:
+  description: Core read-only shell utilities (no filesystem or network mutation)
+  commands:
+    - [cat]
+    - [ls]
+    - [head]
+    - [tail]
+    - [wc]
+    - [echo]
+    - [grep]
+    - [sort]
+    - [uniq]
+    - [diff]
+    - [which]
+    - [env]
+    - [pwd]
+
+git:
+  description: Read-only git inspection commands
+  commands:
+    - [git, status]
+    - [git, diff]
+    - [git, log]
+    - [git, show]
+
+node:
+  description: Read-only Node.js project commands
+  commands:
+    - [npm, test]
+    - [npm, ls]
+    - [yarn, test]
+
+python:
+  description: Read-only Python project commands
+  commands:
+    - [pytest]
+    - [python, -m, pytest]
+    - [pip, list]
+    - [python, -m, mypy]
+
+rust:
+  description: Read-only Rust project commands
+  commands:
+    - [cargo, test]
+    - [cargo, check]
+    - [cargo, clippy]
+
+docker:
+  description: Read-only Docker inspection commands
+  commands:
+    - [docker, ps]
+    - [docker, logs]
+
+k8s:
+  description: Read-only Kubernetes inspection commands
+  commands:
+    - [kubectl, get]
+    - [kubectl, describe]
+    - [kubectl, logs]
+
+nix:
+  description: Read-only Nix evaluation/check commands
+  commands:
+    - [nix, flake, check]
+    - [nix, eval]
+
+terraform:
+  description: Read-only Terraform/OpenTofu inspection commands
+  commands:
+    - [terraform, plan]
+    - [terraform, validate]
+    - [terraform, show]
+    - [terraform, output]
+    - [terraform, graph]
+    - [terraform, version]
+    - [terraform, providers]
+    - [terraform, state, list]
+    - [terraform, state, show]
+    - [tofu, plan]
+    - [tofu, validate]
+    - [tofu, show]
+    - [tofu, output]
+    - [tofu, graph]
+    - [tofu, version]
+    - [tofu, providers]
+    - [tofu, state, list]
+    - [tofu, state, show]
