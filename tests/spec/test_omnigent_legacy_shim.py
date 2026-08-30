@@ -727,3 +727,110 @@ def test_rate_limit_factory_reset_turn_propagates_through_shim_and_policy() -> N
     assert _call_once() == PolicyAction.ALLOW
     assert _call_once() == PolicyAction.ALLOW
     assert _call_once() == PolicyAction.DENY
+
+
+# ── factory_kwargs presence vs. truthiness ───────────────────
+
+
+def test_build_without_factory_kwargs_uses_target_directly(
+    ephemeral_module: Any,
+) -> None:
+    """
+    ``factory_kwargs=None`` (the YAML declared no
+    ``factory_params:``) means *target* IS the evaluator — the
+    shim must not call it as a factory.
+
+    What breaks if this fails: every plain handler gets invoked
+    once at build time with no arguments, and the policy's
+    build blows up (or, worse, the handler's return value is
+    installed as the evaluator).
+    """
+    calls: list[tuple[Any, ...]] = []
+
+    def _modern(ctx: EvaluationContext, context: dict[str, Any]) -> dict[str, Any]:
+        calls.append((ctx, context))
+        return {"action": "allow"}
+
+    ephemeral_module.plain = _modern
+    resolved = build("_legacy_shim_test_ephemeral.plain")
+    # Identity: the target itself came back, never called as a factory.
+    assert resolved is _modern
+    assert calls == []
+
+
+def test_build_treats_empty_factory_kwargs_as_a_factory_call(
+    ephemeral_module: Any,
+) -> None:
+    """
+    ``factory_kwargs={}`` (the YAML declared ``factory_params: {}``)
+    means *target* is a factory taking no arguments — the shim
+    must call it with zero kwargs and use its return value.
+
+    An empty dict is falsy, so a truthiness test here silently
+    skips the factory call and installs the *factory itself* as
+    the evaluator. The engine then calls it with the event and
+    the policy dies at startup with
+    ``"<factory>() takes 0 positional arguments but 1 was given"``.
+    That failure mode makes every zero-parameter factory
+    (``read_only_os``, ``spawn_bounds``, ``worktree_guard``,
+    ``headless_subagent_purpose_guard``) undeclarable in YAML:
+    no non-empty dict exists to pass.
+    """
+    factory_calls: list[dict[str, Any]] = []
+
+    def _zero_param_factory(**kwargs: Any) -> Any:
+        factory_calls.append(dict(kwargs))
+
+        def _evaluate(ctx: EvaluationContext, context: dict[str, Any]) -> dict[str, Any]:
+            return {"action": "deny", "reason": "from factory"}
+
+        return _evaluate
+
+    ephemeral_module.zero_param_factory = _zero_param_factory
+    resolved = build(
+        "_legacy_shim_test_ephemeral.zero_param_factory",
+        factory_kwargs={},
+    )
+    # The factory ran exactly once, with no kwargs.
+    assert factory_calls == [{}]
+    # The evaluator is the factory's *return value*, not the factory.
+    assert resolved is not _zero_param_factory
+    result = resolved(
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            content={"tool": "x", "args": {}},
+            tool_name="x",
+        ),
+        {"labels": {}},
+    )
+    assert result == {"action": "deny", "reason": "from factory"}
+
+
+def test_build_zero_param_builtin_factory_with_empty_factory_kwargs() -> None:
+    """
+    The real zero-parameter builtin ``read_only_os`` builds
+    through the shim when declared with ``factory_params: {}``.
+
+    ``read_only_os()`` takes only keyword-only parameters with
+    defaults, so ``{}`` is the *only* way to declare it in YAML.
+    The built evaluator must be the factory's inner
+    ``fn(event, config)`` — denying writes, allowing reads.
+
+    What breaks if this fails: report-only agents (Sentinel and
+    its sub-agents) can't declare ``read_only_os`` at all; the
+    agent dies at startup instead of gating ``sys_os_write``.
+    """
+    evaluate = build(
+        "omnigent.policies.builtins.orchestration.read_only_os",
+        factory_kwargs={},
+    )
+    write_event = {
+        "type": "tool_call",
+        "data": {"name": "sys_os_write", "arguments": {"path": "a.py", "content": "x"}},
+    }
+    read_event = {
+        "type": "tool_call",
+        "data": {"name": "sys_os_read", "arguments": {"path": "a.py"}},
+    }
+    assert evaluate(write_event, {})["result"] == "DENY"
+    assert evaluate(read_event, {})["result"] == "ALLOW"
