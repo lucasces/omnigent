@@ -817,7 +817,7 @@ def _translate_function_policy_yaml(
     # The wrapper lives at load time — zero cost in the engine's
     # hot evaluate() loop.
     shim_args: dict[str, Any] = {"target": callable_path}
-    if factory_params:
+    if factory_params is not None:
         shim_args["factory_kwargs"] = factory_params
     out["function"] = {
         "path": "omnigent.spec._omnigent_legacy_shim.build",

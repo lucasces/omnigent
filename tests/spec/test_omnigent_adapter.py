@@ -2547,3 +2547,110 @@ def test_compat_yaml_executor_api_key_auth_is_not_dropped(tmp_path: Path) -> Non
 
     assert isinstance(spec.executor.auth, ApiKeyAuth)
     assert spec.executor.auth.api_key == "sk-test-key"
+
+
+def test_function_policy_with_empty_factory_params_forwards_empty_factory_kwargs() -> None:
+    """
+    ``factory_params: {}`` must survive translation as
+    ``factory_kwargs: {}`` — presence, not truthiness, decides
+    whether the handler is a factory.
+
+    An empty dict is falsy, so a truthiness test drops the key
+    entirely; the shim then treats the factory as the evaluator
+    and the agent dies at startup with
+    ``"<factory>() takes 0 positional arguments but 1 was given"``.
+    Zero-parameter factories (``read_only_os``, ``spawn_bounds``,
+    ``worktree_guard``, ``headless_subagent_purpose_guard``) have
+    no non-empty dict to declare, so they become undeclarable in
+    YAML altogether.
+    """
+    from omnigent.spec.types import FunctionPolicySpec
+
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml(
+        policies={
+            "read_only": {
+                "type": "function",
+                "handler": "omnigent.policies.builtins.orchestration.read_only_os",
+                "factory_params": {},
+            },
+        },
+    )
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert spec.guardrails is not None
+    assert spec.guardrails.policies is not None
+    policy = spec.guardrails.policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.function is not None
+    assert policy.function.path == "omnigent.spec._omnigent_legacy_shim.build"
+    assert policy.function.arguments == {
+        "target": "omnigent.policies.builtins.orchestration.read_only_os",
+        "factory_kwargs": {},
+    }
+
+
+def test_function_policy_without_factory_params_omits_factory_kwargs() -> None:
+    """
+    No ``factory_params:`` key at all means the handler IS the
+    evaluator — the translator must not invent a
+    ``factory_kwargs`` entry, or the shim would call every plain
+    handler as a factory at build time.
+
+    Pinned alongside the ``{}`` and populated cases so the three
+    behaviours can't drift apart.
+    """
+    from omnigent.spec.types import FunctionPolicySpec
+
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml(
+        policies={
+            "block_sleep": {
+                "type": "function",
+                "handler": "tests.resources.examples._shared.tool_functions.block_long_sleep",
+            },
+        },
+    )
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert spec.guardrails is not None
+    assert spec.guardrails.policies is not None
+    policy = spec.guardrails.policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.function is not None
+    assert policy.function.arguments == {
+        "target": "tests.resources.examples._shared.tool_functions.block_long_sleep",
+    }
+
+
+def test_zero_param_factory_policy_builds_end_to_end_from_empty_factory_params() -> None:
+    """
+    End-to-end: a YAML policy declaring the zero-parameter builtin
+    ``read_only_os`` with ``factory_params: {}`` translates and
+    then *builds* into a working evaluator.
+
+    This is the case that was impossible before presence-testing:
+    translator + shim each dropped the empty dict, so the agent
+    never got past startup. Covers both layers in one pass — a
+    fix in only one of them still fails here.
+    """
+    from omnigent.spec._omnigent_legacy_shim import build
+    from omnigent.spec.types import FunctionPolicySpec
+
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml(
+        policies={
+            "read_only": {
+                "type": "function",
+                "handler": "omnigent.policies.builtins.orchestration.read_only_os",
+                "factory_params": {},
+            },
+        },
+    )
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+    assert spec.guardrails is not None
+    assert spec.guardrails.policies is not None
+    policy = spec.guardrails.policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.function is not None
+    evaluate = build(**policy.function.arguments)
+    write_event = {
+        "type": "tool_call",
+        "data": {"name": "sys_os_edit", "arguments": {"path": "a.py"}},
+    }
+    assert evaluate(write_event, {})["result"] == "DENY"

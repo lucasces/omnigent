@@ -129,7 +129,7 @@ def build(
     module_path, attr = target.rsplit(".", 1)
     module = importlib.import_module(module_path)
     resolved: object = getattr(module, attr)
-    if factory_kwargs:
+    if factory_kwargs is not None:
         resolved = cast(_PolicyCallable, resolved)(**factory_kwargs)
     if not callable(resolved):
         raise TypeError(
