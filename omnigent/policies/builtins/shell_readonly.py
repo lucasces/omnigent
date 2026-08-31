@@ -136,6 +136,9 @@ def list_read_only_presets() -> dict[str, str]:
     }
 
 
+_WILDCARD_TOKEN = "*"
+
+
 def _matches_pattern(tokens: list[str], pattern: tuple[str, ...]) -> bool:
     """
     Whether real-invocation *tokens* start with *pattern*.
@@ -144,20 +147,31 @@ def _matches_pattern(tokens: list[str], pattern: tuple[str, ...]) -> bool:
     (``/usr/bin/git status``) matches like the bare word. Remaining pattern
     tokens are compared literally against the following tokens (subcommand
     words), so ``("git", "status")`` matches ``["git", "status", "-s"]`` but
-    not ``["git", "stash"]``.
+    not ``["git", "stash"]`` — except a pattern token that is exactly
+    ``"*"``, which matches any single token in that position. This is for
+    an argument whose *value* doesn't change the command's safety, only
+    where it targets — e.g. ``("git", "-C", "*", "status")`` matches
+    ``git -C <any path> status`` without pinning a literal path, since
+    ``git status`` is read-only no matter which repo it targets. Only ever
+    put a wildcard where every possible value is equally safe: a wildcard
+    in the subcommand position itself would allow-list far more than
+    intended.
 
     :param tokens: Real-invocation tokens of one segment, e.g.
         ``["git", "status", "-s"]``.
     :param pattern: A command pattern from a preset, e.g.
-        ``("git", "status")``.
+        ``("git", "status")`` or ``("git", "-C", "*", "status")``.
     :returns: ``True`` if *tokens* starts with *pattern*.
     """
     if len(tokens) < len(pattern):
         return False
     head = tokens[0].rsplit("/", 1)[-1]
-    if head != pattern[0]:
+    if pattern[0] != _WILDCARD_TOKEN and head != pattern[0]:
         return False
-    return tokens[1 : len(pattern)] == list(pattern[1:])
+    return all(
+        pat_tok in (_WILDCARD_TOKEN, tok)
+        for pat_tok, tok in zip(pattern[1:], tokens[1 : len(pattern)], strict=True)
+    )
 
 
 def allow_read_only_shell(
@@ -312,7 +326,10 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "array", "items": {"type": "string"}},
                     "description": "Extra command patterns beyond the presets, "
-                    'each a token list, e.g. [["make", "test"]].',
+                    'each a token list, e.g. [["make", "test"]]. A token that is '
+                    'exactly "*" matches any single value at that position — use it '
+                    "only where every possible value is equally safe, e.g. "
+                    '[["git", "-C", "*", "status"]] for git status against any repo.',
                 },
                 "shell_tools": {
                     "type": "array",
