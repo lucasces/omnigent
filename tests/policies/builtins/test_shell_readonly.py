@@ -93,6 +93,36 @@ def test_bash_c_unwraps_and_evaluates_inner_command() -> None:
     assert result["result"] == "ASK"
 
 
+def test_nix_develop_command_unwraps_and_evaluates_inner_argv() -> None:
+    """``nix develop ... --command <argv>`` runs argv directly (no shell
+    re-parsing) — the flake ref / flags before ``--command`` are skipped."""
+    policy = allow_read_only_shell(presets=["core", "git"])
+    cmd = "nix develop ~/personal/nixos#rust --command git status"
+    assert _action(policy(_sh(cmd))) == "ALLOW"
+    result = policy(_sh("nix develop .#rust --command git push origin main"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_nix_develop_without_command_flag_is_unresolved() -> None:
+    """Bare ``nix develop`` (interactive shell, no ``--command``) isn't
+    unwrapped to anything — it's just an unmatched head."""
+    policy = allow_read_only_shell(presets=["core"])
+    result = policy(_sh("nix develop .#rust"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_nix_shell_run_unwraps_command_string() -> None:
+    """``nix-shell --run "<cmd>"`` takes a command STRING (re-shlexed),
+    unlike ``nix develop --command``'s raw argv."""
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh('nix-shell -p git --run "cat foo.txt"'))) == "ALLOW"
+    result = policy(_sh('nix-shell -p git --run "rm -rf /"'))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
 def test_command_substitution_hiding_unsafe_command_asks() -> None:
     policy = allow_read_only_shell(presets=["core"])
     result = policy(_sh("echo $(rm -rf /)"))
@@ -131,6 +161,38 @@ def test_extra_allow_extends_presets() -> None:
     policy = allow_read_only_shell(presets=["core"], extra_allow=[["make", "test"]])
     assert _action(policy(_sh("make test"))) == "ALLOW"
     assert _action(policy(_sh("make deploy"))) == "ASK"
+
+
+def test_extra_allow_wildcard_matches_any_single_token() -> None:
+    """A ``"*"`` pattern token matches any value at that position — e.g. a
+    ``-C <path>`` argument whose value doesn't change whether the command
+    is read-only."""
+    policy = allow_read_only_shell(
+        presets=["core"],
+        extra_allow=[["git", "-C", "*", "status"]],
+    )
+    assert _action(policy(_sh("git -C /home/alice/repo status"))) == "ALLOW"
+    assert _action(policy(_sh("git -C ~/repo status"))) == "ALLOW"
+    assert _action(policy(_sh('git -C "$(pwd)" status'))) == "ALLOW"
+
+
+def test_extra_allow_wildcard_does_not_relax_the_subcommand() -> None:
+    """The wildcard only covers the position it's in — a different
+    subcommand after the wildcarded path still ASKs."""
+    policy = allow_read_only_shell(
+        presets=["core"],
+        extra_allow=[["git", "-C", "*", "status"]],
+    )
+    assert _action(policy(_sh("git -C /home/alice/repo push"))) == "ASK"
+
+
+def test_extra_allow_wildcard_requires_a_token_to_be_present() -> None:
+    """A wildcard position still needs a token there — it isn't optional."""
+    policy = allow_read_only_shell(
+        presets=["core"],
+        extra_allow=[["git", "-C", "*", "status"]],
+    )
+    assert _action(policy(_sh("git -C status"))) == "ASK"
 
 
 def test_unknown_preset_name_ignored() -> None:

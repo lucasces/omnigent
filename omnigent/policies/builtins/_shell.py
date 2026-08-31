@@ -114,6 +114,30 @@ _ENV_SPLIT_STRING_FLAGS: frozenset[str] = frozenset({"-S", "--split-string"})
 # own flags: ``timeout 5m git push`` / ``timeout -s KILL 5m git push``.
 _DURATION_WRAPPERS: frozenset[str] = frozenset({"timeout"})
 
+# Wrappers that run a program identified after a SEPARATOR token, where
+# everything from the separator on IS the real invocation's own argv
+# (exec-style — no shell re-parsing, unlike the string-capturing wrappers in
+# :data:`_COMMAND_STRING_FLAGS` below). The wrapper's own head may be more
+# than one token (``nix develop``) and may carry an unmodelled prefix before
+# the separator (a flake ref, extra flags) — that prefix can't itself run a
+# shell command through these forms, so skipping it wholesale up to the
+# first separator token is safe. No separator token present means the
+# invocation isn't running a specific command (bare ``nix develop`` opens an
+# interactive shell) and is left unresolved rather than guessed at.
+_ARGV_SEPARATOR_WRAPPERS: dict[tuple[str, ...], frozenset[str]] = {
+    ("nix", "develop"): frozenset({"--command", "-c"}),
+    ("nix", "shell"): frozenset({"--command"}),
+}
+
+# Wrappers that take the real command as a single STRING argument to a flag
+# (re-parsed like ``bash -c``), rather than as their own trailing argv. Kept
+# separate from :data:`SHELL_INTERPRETERS` because these aren't general
+# shell interpreters and don't support bundled short flags (``-lc``).
+_COMMAND_STRING_FLAGS: dict[str, frozenset[str]] = {
+    "nix-shell": frozenset({"--run", "--command"}),
+    "aws-sso": frozenset({"-c", "--command"}),
+}
+
 # Shell interpreters that run a command string passed via ``-c`` (or, for
 # ``eval``, as positional words). Their inner command is parsed recursively so
 # ``bash -c "git push …"`` is gated like a bare ``git push …`` rather than
@@ -237,6 +261,9 @@ def real_invocation_tokens(tokens: list[str]) -> list[str]:
     """
     index = 0
     while index < len(tokens):
+        unwrapped = _skip_argv_separator_wrapper(tokens[index:])
+        if unwrapped is not None:
+            return real_invocation_tokens(unwrapped)
         token = tokens[index]
         word = token.rsplit("/", 1)[-1]
         if word in CMD_WRAPPERS or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
@@ -259,6 +286,30 @@ def real_invocation_tokens(tokens: list[str]) -> list[str]:
             continue
         break
     return tokens[index:]
+
+
+def _skip_argv_separator_wrapper(tokens: list[str]) -> list[str] | None:
+    """
+    Skip an :data:`_ARGV_SEPARATOR_WRAPPERS` invocation to its real argv.
+
+    :param tokens: Tokens starting at a candidate wrapper head, e.g.
+        ``["nix", "develop", ".#rust", "--command", "cargo", "test"]``.
+    :returns: The real invocation's own tokens (``["cargo", "test"]``), or
+        ``None`` when *tokens* doesn't start with a recognized wrapper head,
+        or the head is present with no separator token after it (nothing to
+        unwrap — e.g. bare ``nix develop`` with no ``--command``).
+    """
+    if not tokens:
+        return None
+    head0 = tokens[0].rsplit("/", 1)[-1]
+    for head, separators in _ARGV_SEPARATOR_WRAPPERS.items():
+        if head0 != head[0] or tuple(tokens[1 : len(head)]) != head[1:]:
+            continue
+        for i in range(len(head), len(tokens)):
+            if tokens[i] in separators:
+                return tokens[i + 1 :] or None
+        return None
+    return None
 
 
 def is_unresolved_invocation(tokens: list[str]) -> bool:
@@ -372,7 +423,8 @@ def unwrap_shell_command(tokens: list[str]) -> str | None:
         stripped), e.g. ``["bash", "-c", "git push origin main"]``,
         ``["eval", "git", "push"]`` or ``["env", "-S", "git push origin main"]``.
     :returns: The wrapped command string to re-parse, or ``None`` when *tokens*
-        is not a shell-interpreter / ``eval`` / ``env -S`` invocation.
+        is not a shell-interpreter / ``eval`` / ``env -S`` / other
+        :data:`_COMMAND_STRING_FLAGS` invocation.
     """
     head = tokens[0].rsplit("/", 1)[-1]
     if head == "env":
@@ -393,4 +445,10 @@ def unwrap_shell_command(tokens: list[str]) -> str | None:
         # ``eval`` runs its remaining words as a command (often a single quoted
         # string after shlex-splitting); rejoin them to re-parse.
         return " ".join(tokens[1:]) if len(tokens) > 1 else None
+    if head in _COMMAND_STRING_FLAGS:
+        flags = _COMMAND_STRING_FLAGS[head]
+        for i, tok in enumerate(tokens):
+            if tok in flags and i + 1 < len(tokens):
+                return tokens[i + 1]
+        return None
     return None
