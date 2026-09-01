@@ -42,8 +42,20 @@ export interface InboxSource {
  * Dedupes by elicitation id — a child session's prompt is mirrored
  * into ancestor snapshots, so the same elicitation can arrive under
  * several rows; the first (newest row) occurrence wins.
+ *
+ * Display fields (title/timestamp/"Open session" link), however,
+ * always come from the row that OWNS the elicitation — the session
+ * `resolveSessionId` points at — never from whichever row the dedupe
+ * happened to see first. A mirrored copy in an ancestor's snapshot
+ * must not borrow the ancestor's identity when the real owner's row
+ * is also present in `sources` (it normally is: the owning session's
+ * own `pending_elicitations_count` is what got it into the inbox
+ * query in the first place).
  */
 export function collectInboxItems(sources: InboxSource[]): InboxItem[] {
+  const rowById = new Map<string, Conversation>();
+  for (const { row } of sources) rowById.set(row.id, row);
+
   const items: InboxItem[] = [];
   const seen = new Set<string>();
   const newestFirst = [...sources].sort((a, b) => b.row.updated_at - a.row.updated_at);
@@ -53,9 +65,10 @@ export function collectInboxItems(sources: InboxSource[]): InboxItem[] {
       if (evt === null || evt.type !== "elicitation_request") continue;
       if (seen.has(evt.elicitationId)) continue;
       seen.add(evt.elicitationId);
+      const resolveSessionId = evt.targetSessionId ?? row.id;
       items.push({
-        row,
-        resolveSessionId: evt.targetSessionId ?? row.id,
+        row: rowById.get(resolveSessionId) ?? row,
+        resolveSessionId,
         elicitation: evt,
       });
     }

@@ -38,6 +38,7 @@ import {
   ExternalLinkIcon,
   InfoIcon,
   MessageCircleQuestionMark,
+  Share2Icon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
@@ -124,6 +125,15 @@ interface ApprovalCardProps {
   policyName: string;
   contentPreview: string;
   requestedSchema: Record<string, unknown>;
+  /**
+   * Human-readable label for the session that actually owns this
+   * elicitation — set only when the card was mirrored from a
+   * sub-agent into a session other than the one it belongs to.
+   * Renders a "From: <label>" origin badge so a mirrored card can
+   * never be mistaken for one native to the session being viewed.
+   * Absent/null for a first-party card.
+   */
+  targetSessionLabel?: string | null;
   /**
    * Standalone approval page URL when the elicitation uses URL mode.
    * When present, the pending card renders a link to the approval page
@@ -221,6 +231,7 @@ export function ApprovalCard({
   policyName,
   contentPreview,
   requestedSchema,
+  targetSessionLabel,
   url,
   status,
   response,
@@ -234,6 +245,20 @@ export function ApprovalCard({
   rememberScope,
   onSubmit,
 }: ApprovalCardProps) {
+  // Origin badge: renders ONLY on a card mirrored here from another
+  // (sub-agent) session, so it can never be mistaken for a prompt
+  // native to the session being viewed. Approving/rejecting still
+  // posts to that other session's resolve endpoint either way — this
+  // is a visibility fix only, not a behavior change.
+  const originBadge = targetSessionLabel && (
+    <div
+      className="flex w-fit items-center gap-1 rounded-full border border-blue-500/30 bg-blue-500/10 px-2 py-0.5 text-xs font-medium text-blue-700 dark:text-blue-400"
+      data-testid="approval-card-origin"
+    >
+      <Share2Icon className="size-3" />
+      From: {targetSessionLabel}
+    </div>
+  );
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content) => {
@@ -534,6 +559,7 @@ export function ApprovalCard({
         data-state="responded"
         className="flex flex-col gap-1 border-muted"
       >
+        {originBadge}
         <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
           {label}
@@ -589,6 +615,7 @@ export function ApprovalCard({
       data-state="pending"
       className="flex flex-col gap-2 py-3 px-4"
     >
+      {originBadge}
       <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval || isKiroCommandApproval ? (
           <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
@@ -810,6 +837,7 @@ export function ElicitationCard({
       policyName={item.policyName}
       contentPreview={item.contentPreview}
       requestedSchema={item.requestedSchema}
+      targetSessionLabel={item.targetSessionLabel}
       url={item.url}
       status={item.status}
       response={item.response}

@@ -25,14 +25,21 @@ export function useApproveHotkey(): void {
       if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
       if (e.key !== "Enter") return;
 
-      const { blocks, submitApproval } = useChatStore.getState();
+      const { blocks, conversationId, submitApproval } = useChatStore.getState();
       // Newest-first: accept the most recent still-pending prompt that takes a
-      // plain verdict. Skip AskUserQuestion (needs an explicit choice).
+      // plain verdict. Skip AskUserQuestion (needs an explicit choice), and
+      // skip prompts mirrored in from a sub-agent session (targetSessionId
+      // set to something other than the session being viewed) — the hotkey
+      // must only ever act on this chat's own prompts, mirroring the same
+      // per-session guard ChatPage's hasPendingElicitation check uses.
       const pending = [...blocks]
         .reverse()
         .find(
           (b): b is ElicitationBlock =>
-            b.type === "elicitation" && b.status === "pending" && !b.askUserQuestion,
+            b.type === "elicitation" &&
+            b.status === "pending" &&
+            !b.askUserQuestion &&
+            (b.targetSessionId == null || b.targetSessionId === conversationId),
         );
       if (!pending) return;
 

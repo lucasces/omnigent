@@ -422,6 +422,12 @@ export interface ElicitationBlock {
    * ancestor chat; null/undefined means use the active session.
    */
   targetSessionId?: string | null;
+  /**
+   * Human-readable label for `targetSessionId` (the mirrored-from
+   * session's title), so a mirrored card can be marked with its true
+   * origin. `null`/absent when `targetSessionId` is unset or unlabeled.
+   */
+  targetSessionLabel?: string | null;
   /** Human-readable message describing what's being gated. */
   message: string;
   /** "input" | "tool_call" | "tool_result" | "output". */

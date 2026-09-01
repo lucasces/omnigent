@@ -1352,10 +1352,27 @@ async def _apply_liveness_to_items(
             item.pending_elicitations_count = 0
 
 
+def _session_display_label(conv: Conversation) -> str:
+    """
+    Best-effort human-readable label for a session.
+
+    Used to mark a mirrored elicitation card with its true origin so
+    it can never be mistaken for a first-party prompt on the viewed
+    session.
+
+    :param conv: Conversation to label.
+    :returns: ``conv.title`` when set (sub-agents store
+        ``"<type>:<name>"`` there — see :class:`Conversation`), else
+        the raw session id.
+    """
+    return conv.title or conv.id
+
+
 def _targeted_elicitation_event(
     event: dict[str, Any],
     *,
     target_session_id: str,
+    target_session_label: str | None = None,
 ) -> dict[str, Any]:
     """
     Return an elicitation event annotated with its resolution target.
@@ -1364,22 +1381,31 @@ def _targeted_elicitation_event(
     chat stream. The mirrored card is rendered in the ancestor
     conversation, but the harness Future still belongs to the child.
     ``target_session_id`` tells clients which session's resolve URL
-    should receive the verdict.
+    should receive the verdict; ``target_session_label`` lets the
+    client render a provenance marker ("From: <label>") instead of
+    rendering the mirrored card identically to a first-party one.
 
     :param event: Original ``response.elicitation_request`` event,
         e.g. ``{"type": "response.elicitation_request",
         "elicitation_id": "elicit_abc", "params": {...}}``.
     :param target_session_id: Session that owns the parked
         elicitation, e.g. ``"conv_child123"``.
+    :param target_session_label: Human-readable label for that
+        session, e.g. ``"sub_agent:researcher"``. Omitted from the
+        payload when unknown.
     :returns: A shallow event copy with a copied ``params`` dict
-        carrying ``target_session_id``.
+        carrying ``target_session_id`` (and ``target_session_label``
+        when given).
     """
     mirrored = dict(event)
     params = event.get("params")
+    extra: dict[str, Any] = {"target_session_id": target_session_id}
+    if target_session_label:
+        extra["target_session_label"] = target_session_label
     if isinstance(params, dict):
-        mirrored["params"] = {**params, "target_session_id": target_session_id}
+        mirrored["params"] = {**params, **extra}
     else:
-        mirrored["params"] = {"target_session_id": target_session_id}
+        mirrored["params"] = extra
     return mirrored
 
 
@@ -1422,7 +1448,11 @@ def _publish_elicitation_request_to_ancestors(
         e.g. ``"conv_child123"``.
     :param event: Original ``response.elicitation_request`` event.
     """
-    mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
+    child = conv_store.get_conversation(session_id)
+    label = _session_display_label(child) if child is not None else None
+    mirrored = _targeted_elicitation_event(
+        event, target_session_id=session_id, target_session_label=label
+    )
     for ancestor_id in _ancestor_session_ids(conv_store, session_id):
         session_stream.publish(ancestor_id, mirrored)
 
@@ -1524,7 +1554,13 @@ def _pending_elicitation_snapshot_for_session(
                 continue
             if isinstance(elicitation_id, str):
                 seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+            events.append(
+                _targeted_elicitation_event(
+                    event,
+                    target_session_id=child.id,
+                    target_session_label=_session_display_label(child),
+                )
+            )
     return events
 
 
