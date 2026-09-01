@@ -216,10 +216,17 @@ def split_command_segments(command: str) -> list[str]:
     ``&&`` is consumed whole rather than split into two empty halves.
     Command substitutions (``$(...)`` / backticks) are pulled out first and
     their bodies appended as their own segments, so a command hidden inside one
-    (``x=$(git push <url>)``) is still gated. This is a naive split that does
-    not honor operators appearing inside quotes — acceptable because the
-    commands these policies gate do not embed these operators in quoted args in
-    practice, and a mis-split only ever produces an extra ignored segment.
+    (``x=$(git push <url>)``) is still gated.
+
+    The split is quote-aware: an operator character inside a single- or
+    double-quoted argument (``grep -E "a|b" file``) belongs to that argument,
+    not to a chaining operator, and must not be split on — doing so silently
+    truncated the segment handed to every downstream policy at the first such
+    character, hiding the rest of the real command from evaluation entirely.
+    An unterminated quote is treated as extending to the end of the string
+    (fail-closed: the merged remainder becomes one segment, which then either
+    fails to tokenize or fails to match an allowlist pattern, so it can only
+    ever cost an extra ASK, never a missed check).
 
     Splitting on a lone ``&`` matters for the gate: without it, a benign
     leading command could hide a gated one behind a background operator
@@ -232,11 +239,71 @@ def split_command_segments(command: str) -> list[str]:
         ``["cd /repo", "npm test"]``.
     """
     outer, bodies = _extract_command_substitutions(command)
-    parts = re.split(r"&&|\|\||[;|\n&]", outer)
-    segments = [seg.strip() for seg in parts if seg.strip()]
+    segments = [seg.strip() for seg in _split_unquoted(outer) if seg.strip()]
     for body in bodies:
         segments.extend(split_command_segments(body))
     return segments
+
+
+def _split_unquoted(command: str) -> list[str]:
+    """
+    Split *command* on chaining operators (``&&``, ``||``, ``;``, ``|``,
+    ``&``, newline) that appear outside single/double quotes.
+
+    Tracks quote state and backslash escapes character-by-character rather
+    than using a single regex, since the operator set can't be expressed as a
+    regex without also matching inside quoted arguments. Only tracks whether a
+    character is quoted, not full shell-word semantics — the result is
+    re-tokenized with :mod:`shlex` downstream, which is where genuine quoting
+    errors are surfaced (as a tokenization failure, handled fail-closed by
+    every caller).
+
+    :param command: A command string with substitutions already extracted.
+    :returns: The raw (untrimmed) segments between operators.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            current.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                # Inside double quotes, backslash still escapes the next
+                # character (notably a literal `"`) — consume both so an
+                # escaped quote doesn't end the quoted region early.
+                current.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            current.append(ch)
+            current.append(command[i + 1])
+            i += 2
+            continue
+        if command.startswith("&&", i) or command.startswith("||", i):
+            parts.append("".join(current))
+            current = []
+            i += 2
+            continue
+        if ch in ";|\n&":
+            parts.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    parts.append("".join(current))
+    return parts
 
 
 def real_invocation_tokens(tokens: list[str]) -> list[str]:

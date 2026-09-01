@@ -50,13 +50,22 @@ YAML usage::
 
 from __future__ import annotations
 
+import dataclasses
 import functools
+import re
 import shlex
 from collections.abc import Callable
 from importlib import resources
 from typing import Any
 
 import yaml
+
+try:
+    import celpy
+    from celpy.adapter import json_to_cel
+    from celpy.evaluation import CELEvalError
+except ImportError:
+    celpy = None  # type: ignore[assignment]
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
@@ -94,6 +103,303 @@ def _has_unsafe_shell_syntax(segment: str) -> bool:
     return ">" in segment or "<(" in segment
 
 
+# ── Full-argv CEL guards ─────────────────────────────────────────────────
+#
+# A plain prefix pattern (e.g. ``(git, status)``) is enough when every
+# dangerous variant of a command differs in its FIRST tokens. That is false
+# for ``find``, ``sed``, and ``awk``: their write/exec vectors
+# (``-exec``/``-delete``, ``-i``/embedded ``w``·``e``, ``system()``/redirects)
+# can appear anywhere in the argv, or inside a free-form script-text operand
+# rather than as an isolated flag (see docs/shell-readonly-allowlist-audit.md
+# §5–§6, which is why these three are excluded from a plain prefix pattern).
+# A guarded pattern entry pairs a prefix with a CEL expression evaluated
+# against the FULL real-invocation token list (`tokens`) and, for sed/awk,
+# a small set of Python-computed derived facts (`facts`) that need real
+# string parsing CEL isn't suited for (locating the script-text operand
+# among flags, scanning it for embedded write/exec constructs). The
+# expression must evaluate `true` for a DANGEROUS command — a `false` or any
+# evaluation error (missing fact, bad expression, non-bool result) is treated
+# as dangerous too, so an enumeration gap fails to ASK, never silently to
+# ALLOW.
+#
+# Residual risk (documented, not eliminated — see the PR's Coverage notes):
+#   - The predicate/flag lists below are enumerations, like every allowlist
+#     in this module; a variant not enumerated is a gap until it's added.
+#   - Shell expansion ($(...), $VAR, backticks) inside an argument can change
+#     what a command does at runtime without changing its literal tokens;
+#     command substitutions are recursively gated (see _shell.py), but a
+#     plain variable expansion is not.
+#   - The sed/awk script-text scans are regex heuristics over an opaque
+#     string, not a real parser for either language; they favor false
+#     positives (extra ASK) over false negatives by design, per the
+#     ambiguous-must-ASK rule above, but are not exhaustive.
+
+
+def _find_is_dangerous_facts(tokens: list[str]) -> dict[str, bool]:
+    """
+    No derived facts needed for ``find`` — its guard checks ``tokens`` (the
+    predicate list) directly. Present for interface symmetry with the
+    sed/awk extractors and so a guard can always reference ``facts`` without
+    a ``KeyError``.
+
+    :param tokens: Real-invocation tokens of the segment (unused).
+    :returns: An empty mapping.
+    """
+    del tokens
+    return {}
+
+
+_SED_SCRIPT_FLAGS = frozenset({"-e", "--expression"})
+_SED_FILE_FLAGS = frozenset({"-f", "--file"})
+
+# Trailing s///-command flags that turn a substitution into a write (``w``)
+# or an arbitrary shell execution of its output (``e``) — GNU sed extensions
+# whose vector lives inside the script text's own delimiter-quoted syntax,
+# not an isolated CLI flag. Matches the flag immediately after a same-line
+# s-command delimiter (with other flags such as g/i/p optionally between);
+# a delimiter that spans a newline is a known residual gap.
+_SED_TRAILING_WRITE_RE = re.compile(r"[/|#,~!@:^][a-zA-Z]*w[a-zA-Z]*\s+\S")
+_SED_TRAILING_EXEC_RE = re.compile(r"[/|#,~!@:^][a-zA-Z]*e[a-zA-Z]*(?:;|$)", re.MULTILINE)
+# A standalone address-command form of the same two vectors:
+# ``[addr[,addr]] w file`` and GNU sed's ``[addr] e [command]``.
+_SED_ADDR_WRITE_RE = re.compile(r"(?:^|[;\n{])\s*[0-9,$]*\s*[wW]\s+\S")
+_SED_ADDR_EXEC_RE = re.compile(r"(?:^|[;\n{])\s*[0-9,$]*\s*e(?:\s|;|$)", re.MULTILINE)
+
+
+def _sed_script_operands(tokens: list[str]) -> tuple[list[str], bool]:
+    """
+    Best-effort extraction of ``sed``'s inline script-text operand(s).
+
+    Handles the common forms: a single inline script as the first non-flag
+    positional, or one or more ``-e``/``--expression`` scripts (GNU sed joins
+    multiple ``-e`` scripts with a newline before running them, so callers do
+    the same). A script supplied via ``-f``/``--file`` points at a file this
+    function cannot read, so its content can't be scanned — that is reported
+    separately as *has_external_script* rather than guessed at.
+
+    :param tokens: Real-invocation tokens with the leading ``sed`` dropped.
+    :returns: ``(script_texts, has_external_script)``.
+    """
+    args = tokens[1:]
+    has_external = any(tok in _SED_FILE_FLAGS or tok.startswith("--file=") for tok in args)
+    scripts: list[str] = []
+    seen_script_source = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in _SED_SCRIPT_FLAGS:
+            seen_script_source = True
+            if i + 1 < len(args):
+                scripts.append(args[i + 1])
+                i += 2
+                continue
+        elif tok.startswith("--expression="):
+            seen_script_source = True
+            scripts.append(tok.split("=", 1)[1])
+        elif tok.startswith("-e") and len(tok) > 2:
+            seen_script_source = True
+            scripts.append(tok[2:])
+        elif tok in _SED_FILE_FLAGS:
+            # The value is a script FILE this function cannot read, not a
+            # positional to scan — skip both the flag and its value.
+            seen_script_source = True
+            i += 1
+        elif tok.startswith("--file="):
+            seen_script_source = True
+        elif not seen_script_source and not tok.startswith("-") and not scripts:
+            # The first bare positional is the inline script only when no
+            # -e/-f has claimed that role — subsequent positionals are
+            # filenames sed operates on, not more script text.
+            scripts.append(tok)
+            seen_script_source = True
+        i += 1
+    return scripts, has_external
+
+
+def _sed_facts(tokens: list[str]) -> dict[str, bool]:
+    """
+    Derived facts for the ``sed`` guard: in-place editing and script-text
+    write/execute constructs.
+
+    :param tokens: Real-invocation tokens, e.g. ``["sed", "-i", "s/a/b/", "f"]``.
+    :returns: Mapping with ``has_inplace``, ``has_external_script``,
+        ``has_write_command``, and ``has_execute_flag`` booleans.
+    """
+    args = tokens[1:]
+    has_inplace = any(
+        tok == "--in-place"
+        or tok.startswith("--in-place=")
+        or (tok.startswith("-") and not tok.startswith("--") and "i" in tok[1:])
+        for tok in args
+    )
+    scripts, has_external = _sed_script_operands(tokens)
+    blob = "\n".join(scripts)
+    has_write = bool(_SED_TRAILING_WRITE_RE.search(blob) or _SED_ADDR_WRITE_RE.search(blob))
+    has_exec = bool(_SED_TRAILING_EXEC_RE.search(blob) or _SED_ADDR_EXEC_RE.search(blob))
+    return {
+        "has_inplace": has_inplace,
+        "has_external_script": has_external,
+        "has_write_command": has_write,
+        "has_execute_flag": has_exec,
+    }
+
+
+_AWK_SEP_VALUE_FLAGS = frozenset({"-F", "--field-separator"})
+_AWK_ASSIGN_VALUE_FLAGS = frozenset({"-v", "--assign"})
+_AWK_FILE_VALUE_FLAGS = frozenset({"-f", "--file"})
+
+
+def _awk_script_operand(tokens: list[str]) -> tuple[str | None, bool]:
+    """
+    Best-effort extraction of ``awk``'s program-text operand.
+
+    Walks the argv skipping flags known to take a value (``-F``/``-v`` in
+    either the separate-token or attached form, ``-f``/``--file``) to reach
+    the first bare positional, which is the program text in the common
+    ``awk 'PROGRAM' file...`` / ``awk -F: 'PROGRAM' file`` forms. A program
+    supplied via ``-f``/``--file`` points at a file this function cannot
+    read — reported as *has_external_script* rather than guessed at. An
+    unrecognized flag is skipped conservatively (as a valueless flag) rather
+    than guessed to take a value, so it doesn't swallow the real program text.
+
+    :param tokens: Real-invocation tokens with the leading ``awk`` dropped.
+    :returns: ``(script_text, has_external_script)`` — *script_text* is
+        ``None`` when no bare positional was found before a ``-f``/``--file``
+        (i.e. the only program source is an external file).
+    """
+    args = tokens[1:]
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in _AWK_FILE_VALUE_FLAGS or tok.startswith("--file="):
+            # The program comes entirely from a file this function cannot
+            # read; any remaining positionals are input files, not more
+            # program text, so there is nothing further to scan.
+            return None, True
+        if tok in _AWK_SEP_VALUE_FLAGS or tok in _AWK_ASSIGN_VALUE_FLAGS:
+            i += 2
+            continue
+        if tok.startswith(("--field-separator=", "--assign=")):
+            i += 1
+            continue
+        if tok.startswith(("-F", "-v")) and len(tok) > 2:
+            i += 1
+            continue
+        if tok == "-i":
+            # gawk's extension loader (``-i inplace``) — the extension name
+            # is not the program text; the inplace-editing check itself
+            # reads the flag directly, independent of this walk.
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok, False
+    return None, False
+
+
+def _awk_facts(tokens: list[str]) -> dict[str, bool]:
+    """
+    Derived facts for the ``awk`` guard: in-place editing, an external
+    script file, and program-text write-redirection / ``system()`` calls.
+
+    A bare ``>``/``>>`` inside the program text is flagged even though awk
+    also uses ``>`` as a numeric/string comparison operator — the two are
+    not distinguishable without a real awk parser, and per the
+    ambiguous-must-ASK rule this module never guesses that a ``>`` is "just"
+    a comparison. In practice ``has_redirect`` is redundant with — not the
+    only thing catching — that case today: ``_has_unsafe_shell_syntax``
+    already rejects ANY segment containing a literal ``>`` before a guard is
+    ever evaluated, including one inside this script text's quotes. It is
+    computed here anyway so the guard is correct standalone (and directly
+    unit-tested as such), independent of that coarser, whole-segment check.
+
+    :param tokens: Real-invocation tokens, e.g. ``["awk", "{print $1}"]``.
+    :returns: Mapping with ``has_inplace``, ``has_external_script``,
+        ``has_redirect``, and ``has_system_call`` booleans.
+    """
+    has_inplace = any(tok == "-i" for tok in tokens[1:])
+    script, has_external = _awk_script_operand(tokens)
+    if script is None:
+        return {
+            "has_inplace": has_inplace,
+            "has_external_script": True,
+            "has_redirect": False,
+            "has_system_call": False,
+        }
+    return {
+        "has_inplace": has_inplace,
+        "has_external_script": has_external,
+        "has_redirect": ">" in script,
+        "has_system_call": "system(" in script or "system (" in script,
+    }
+
+
+_GUARD_FACT_EXTRACTORS: dict[str, Callable[[list[str]], dict[str, bool]]] = {
+    "find": _find_is_dangerous_facts,
+    "sed": _sed_facts,
+    "awk": _awk_facts,
+}
+
+
+def _compile_guard(
+    expression: str,
+    facts_fn: Callable[[list[str]], dict[str, bool]],
+) -> Callable[[list[str]], bool]:
+    """
+    Compile a pattern entry's CEL guard expression into a callable.
+
+    :param expression: CEL expression over ``tokens`` (the segment's full
+        real-invocation token list) and ``facts`` (the base command's
+        derived-fact mapping). Must evaluate to a bool; ``true`` means the
+        command is DANGEROUS (the pattern does not grant ALLOW).
+    :param facts_fn: The base command's fact extractor
+        (:data:`_GUARD_FACT_EXTRACTORS`).
+    :returns: A callable ``(tokens) -> bool`` — ``True`` when dangerous.
+    :raises ImportError: If ``cel-python`` is not installed.
+    :raises ValueError: If *expression* has a CEL syntax error.
+    """
+    if celpy is None:
+        raise ImportError(
+            "cel-python is required for guarded shell_readonly patterns but is not installed."
+        )
+    env = celpy.Environment()
+    prog = env.program(env.compile(expression))
+
+    def _guard(tokens: list[str]) -> bool:
+        try:
+            result = prog.evaluate(
+                {
+                    "tokens": json_to_cel(list(tokens)),
+                    "facts": json_to_cel(facts_fn(tokens)),
+                }
+            )
+        except (CELEvalError, ValueError, TypeError):
+            # An expression that can't evaluate against this argv (missing
+            # fact, unexpected shape) is exactly the "ambiguous" case the
+            # guard exists to fail closed on.
+            return True
+        return bool(result)
+
+    return _guard
+
+
+@dataclasses.dataclass(frozen=True)
+class _PatternRule:
+    """
+    One allowlist pattern: a literal token prefix plus an optional guard.
+
+    :ivar tokens: The prefix pattern, e.g. ``("git", "status")``.
+    :ivar guard: When set, a compiled CEL guard (:func:`_compile_guard`) that
+        must return ``False`` (not dangerous) for a prefix match to count as
+        safe. ``None`` means the prefix alone is sufficient, as for every
+        plain (unguarded) preset entry.
+    """
+
+    tokens: tuple[str, ...]
+    guard: Callable[[list[str]], bool] | None = None
+
+
 @functools.lru_cache(maxsize=1)
 def _preset_data() -> dict[str, Any]:  # type: ignore[explicit-any]
     """
@@ -106,18 +412,39 @@ def _preset_data() -> dict[str, Any]:  # type: ignore[explicit-any]
     return yaml.safe_load(path.read_text()) or {}
 
 
-def _load_presets() -> dict[str, list[tuple[str, ...]]]:
+@functools.lru_cache(maxsize=1)
+def _load_presets() -> dict[str, list[_PatternRule]]:
     """
-    Load the bundled read-only command presets as matchable patterns.
+    Load the bundled read-only command presets as matchable pattern rules.
+
+    A preset's ``commands`` entries are either a plain list of literal
+    tokens (``[git, status]`` — the prefix alone is sufficient) or a mapping
+    with ``pattern`` and ``guard`` keys (``{pattern: [find], guard: "..."}``
+    — see :data:`_GUARD_FACT_EXTRACTORS`), whose CEL guard is compiled once
+    here and cached for the process lifetime.
 
     :returns: Mapping of preset name (``"core"``, ``"git"``, ...) to a list
-        of command patterns, each a tuple of literal tokens, e.g.
-        ``("git", "status")``.
+        of :class:`_PatternRule`.
     """
-    presets: dict[str, list[tuple[str, ...]]] = {}
+    presets: dict[str, list[_PatternRule]] = {}
     for name, entry in _preset_data().items():
         commands = entry.get("commands", []) if isinstance(entry, dict) else []
-        presets[name] = [tuple(cmd) for cmd in commands if cmd]
+        rules: list[_PatternRule] = []
+        for cmd in commands:
+            if not cmd:
+                continue
+            if isinstance(cmd, dict):
+                pattern = tuple(cmd["pattern"])
+                guard_expr = cmd.get("guard")
+                guard = (
+                    _compile_guard(guard_expr, _GUARD_FACT_EXTRACTORS[pattern[0]])
+                    if guard_expr
+                    else None
+                )
+                rules.append(_PatternRule(pattern, guard))
+            else:
+                rules.append(_PatternRule(tuple(cmd)))
+        presets[name] = rules
     return presets
 
 
@@ -199,11 +526,11 @@ def allow_read_only_shell(
     """
     all_presets = _load_presets()
     selected_names = presets if presets else ["core"]
-    patterns: list[tuple[str, ...]] = []
+    patterns: list[_PatternRule] = []
     for name in selected_names:
         patterns.extend(all_presets.get(name, []))
     for extra in extra_allow or []:
-        patterns.append(tuple(extra))
+        patterns.append(_PatternRule(tuple(extra)))
 
     shell_tool_names = (
         frozenset(shell_tools) if shell_tools is not None else frozenset(SHELL_TOOLS)
@@ -235,7 +562,15 @@ def allow_read_only_shell(
         inner = unwrap_shell_command(tokens)
         if inner is not None:
             return _segment_is_safe(inner, _depth + 1)
-        return any(_matches_pattern(tokens, pattern) for pattern in patterns)
+        for rule in patterns:
+            if not _matches_pattern(tokens, rule.tokens):
+                continue
+            if rule.guard is None or not rule.guard(tokens):
+                return True
+            # Prefix matched but the guard flagged this invocation as
+            # dangerous (e.g. `find ... -exec`) — keep checking in case a
+            # different rule also matches and isn't guarded.
+        return False
 
     def _evaluate_command(command: str) -> PolicyResponse:
         """

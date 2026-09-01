@@ -7,7 +7,12 @@ Tests for the built-in read-only shell allowlist
 
 from __future__ import annotations
 
-from omnigent.policies.builtins.shell_readonly import allow_read_only_shell, list_read_only_presets
+from omnigent.policies.builtins.shell_readonly import (
+    _awk_facts,
+    _sed_facts,
+    allow_read_only_shell,
+    list_read_only_presets,
+)
 from omnigent.policies.registry import get_registry, load_registry, validate_factory_params
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
 from tests.policies.builtins.helpers import tool_call_event as tc
@@ -155,6 +160,179 @@ def test_unresolved_wrapper_flag_asks() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration knobs
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Quoting bug regression (grep -E "a|b")
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_grep_with_pipe_in_quoted_pattern_allows() -> None:
+    """A ``|`` inside a quoted -E pattern is part of the pattern, not a
+    shell pipe — regression test for a segment-splitter bug that silently
+    truncated the command at the first such character."""
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh('grep -E "a|b" file.txt'))) == "ALLOW"
+
+
+def test_grep_recursive_with_pipe_in_quoted_pattern_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh('grep -rn "x|y" dir'))) == "ALLOW"
+
+
+def test_grep_with_combined_flags_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh('grep -ril "needle" . --include=*.py'))) == "ALLOW"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Guarded patterns: find / sed / awk (full-argv CEL guards)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_find_without_exec_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("find . -name *.py"))) == "ALLOW"
+
+
+def test_find_with_exec_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    result = policy(_sh("find / -exec rm -rf {} +"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_find_with_delete_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("find . -delete"))) == "ASK"
+
+
+def test_find_with_fprintf_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("find . -fprintf /tmp/x %p"))) == "ASK"
+
+
+def test_sed_without_inplace_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("sed s/foo/bar/ file.txt"))) == "ALLOW"
+
+
+def test_sed_inplace_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("sed -i s/a/b/ file.txt"))) == "ASK"
+
+
+def test_sed_inplace_with_backup_suffix_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("sed -i.bak s/a/b/ file.txt"))) == "ASK"
+
+
+def test_sed_long_form_inplace_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("sed --in-place s/a/b/ file.txt"))) == "ASK"
+
+
+def test_sed_embedded_write_command_asks() -> None:
+    """The write vector lives in the script text, not an isolated flag."""
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh('sed -n "1,5w output.txt" file'))) == "ASK"
+
+
+def test_sed_embedded_execute_flag_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("sed s/x/y/e file"))) == "ASK"
+
+
+def test_sed_external_script_file_asks() -> None:
+    """Can't inspect an external script file's content, so treat as ambiguous."""
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("sed -f script.sed file"))) == "ASK"
+
+
+def test_awk_plain_program_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("awk '{print $1}'"))) == "ALLOW"
+
+
+def test_awk_with_field_separator_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("awk -F: '{print $1}'"))) == "ALLOW"
+
+
+def test_awk_with_system_call_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("""awk 'BEGIN{system("id")}' """))) == "ASK"
+
+
+def test_awk_with_write_redirect_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("""awk '{print $1 > "out.txt"}' """))) == "ASK"
+
+
+def test_awk_ambiguous_comparison_operator_asks() -> None:
+    """A bare ``>`` can't be told apart from a numeric comparison without a
+    real awk parser — deliberately over-cautious per the ambiguous-must-ASK
+    rule, not a bug."""
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("awk '$1 > 5'"))) == "ASK"
+
+
+def test_awk_gawk_inplace_extension_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("""awk -i inplace '{gsub(/x/,"y")}' file"""))) == "ASK"
+
+
+def test_awk_external_script_file_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("awk -f prog.awk file.txt"))) == "ASK"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Guard fact extractors, tested directly
+#
+# `_awk_facts`'s `has_redirect` is shadowed in the full integration path by
+# `_has_unsafe_shell_syntax`'s coarser, quote-unaware `>` check (it rejects
+# a segment before any guard runs) — see its docstring. These call the
+# extractor directly so that fact is verified in isolation rather than only
+# ever failing closed for a different reason.
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_awk_facts_flags_write_redirect_in_script_text() -> None:
+    facts = _awk_facts(["awk", '{print $1 > "out.txt"}'])
+    assert facts["has_redirect"] is True
+    assert facts["has_system_call"] is False
+
+
+def test_awk_facts_flags_append_redirect_in_script_text() -> None:
+    facts = _awk_facts(["awk", '{print $1 >> "out.txt"}'])
+    assert facts["has_redirect"] is True
+
+
+def test_awk_facts_allows_plain_program_text() -> None:
+    facts = _awk_facts(["awk", "{print $1}"])
+    assert facts == {
+        "has_inplace": False,
+        "has_external_script": False,
+        "has_redirect": False,
+        "has_system_call": False,
+    }
+
+
+def test_sed_facts_flags_inplace_and_write_and_execute() -> None:
+    assert _sed_facts(["sed", "-i", "s/a/b/", "f"])["has_inplace"] is True
+    assert _sed_facts(["sed", "-n", "1,5w output.txt", "f"])["has_write_command"] is True
+    assert _sed_facts(["sed", "s/x/y/e", "f"])["has_execute_flag"] is True
+
+
+def test_sed_facts_allows_plain_substitution() -> None:
+    facts = _sed_facts(["sed", "s/foo/bar/", "file.txt"])
+    assert facts == {
+        "has_inplace": False,
+        "has_external_script": False,
+        "has_write_command": False,
+        "has_execute_flag": False,
+    }
 
 
 def test_extra_allow_extends_presets() -> None:
