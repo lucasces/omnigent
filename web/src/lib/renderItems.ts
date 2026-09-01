@@ -117,6 +117,7 @@ export type RenderItem =
       itemId: string | null;
       elicitationId: string;
       targetSessionId?: string | null;
+      targetSessionLabel?: string | null;
       message: string;
       phase: string;
       policyName: string;
@@ -1538,6 +1539,7 @@ function buildAssistantItems(
         itemId: b.ctx.itemId,
         elicitationId: b.elicitationId,
         targetSessionId: b.targetSessionId,
+        targetSessionLabel: b.targetSessionLabel,
         message: b.message,
         phase: b.phase,
         policyName: b.policyName,
