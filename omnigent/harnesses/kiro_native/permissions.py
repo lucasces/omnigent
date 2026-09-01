@@ -61,12 +61,16 @@ class KiroPermissionRequest:
     decline_option_id: str
     # Kiro truncates ``title`` (with a trailing "...") once the command runs
     # long or multi-line, since it doubles as the TUI's one-line prompt
-    # label. The same request's ``params._meta.trustOptions`` carries an
-    # untruncated copy under the "Full command" label — Kiro's own trust
+    # label. Two untruncated sources can stand in for it, tried in order:
+    # ``params._meta.trustOptions``'s "Full command" row (Kiro's own trust
     # submenu needs the real command to build an allow-pattern from, so it
-    # can't be capped. ``None`` when Kiro omits ``_meta`` (older builds) or
-    # the "Full command" row (non-command prompt kinds, e.g. file edits),
-    # in which case callers fall back to ``title``.
+    # can't be capped), then ``params.toolCall.rawInput.command`` (the
+    # tool call's original argument — present even when a request bypasses
+    # Kiro's native trust submenu entirely, e.g. a Bedrock/Claude-invoked
+    # ``shell`` tool call, which ships no ``_meta`` at all). ``None`` when
+    # neither source is available (older Kiro builds, or a non-command
+    # prompt kind such as a file edit), in which case callers fall back to
+    # ``title``.
     full_command: str | None = None
     # Kiro's TUI offers a third "Trust, always allow in this session" option
     # alongside the one-time allow/decline pair on (in practice) every
@@ -218,6 +222,33 @@ def _extract_full_command(params: dict[str, object]) -> str | None:
     return None
 
 
+def _extract_raw_input_command(params: dict[str, object]) -> str | None:
+    """Return the shell command from ``params.toolCall.rawInput.command``.
+
+    Fallback for permission requests that never go through Kiro's native
+    trust submenu at all, so ``_meta`` (and therefore
+    ``_extract_full_command``) is entirely absent — observed for a ``shell``
+    tool call Kiro forwards from a Bedrock/Claude-invoked agent rather than
+    routing through its own trust UI: the request's ``toolCall`` is just
+    ``{toolCallId, title, rawInput}``. ``rawInput`` is the tool's original,
+    untruncated arguments, so for a shell-invoking tool call its ``command``
+    field carries the real command verbatim — unlike ``title``, which Kiro
+    itself truncates once the command runs long. Other tool-call kinds (file
+    edits, etc.) simply don't have a ``command`` key in ``rawInput``, so this
+    naturally only ever fires for shell-shaped calls.
+    """
+    tool_call = params.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return None
+    raw_input = tool_call.get("rawInput")
+    if not isinstance(raw_input, dict):
+        return None
+    command = raw_input.get("command")
+    if isinstance(command, str) and command.strip():
+        return command
+    return None
+
+
 def parse_permission_request(message: dict[str, object]) -> KiroPermissionRequest | None:
     """Parse a Kiro ACP ``session/request_permission`` message."""
     if message.get("method") != "session/request_permission":
@@ -266,7 +297,7 @@ def parse_permission_request(message: dict[str, object]) -> KiroPermissionReques
         accept_option_id=accept_option_id,
         decline_option_id=decline_option_id,
         always_option_id=always_option_id,
-        full_command=_extract_full_command(params),
+        full_command=_extract_full_command(params) or _extract_raw_input_command(params),
         subagent_session_id=(
             subagent_session_id
             if isinstance(subagent_session_id, str) and subagent_session_id
@@ -678,17 +709,23 @@ async def _run_one_permission(
             "message": f"Kiro wants approval for {permission.preview}",
             "content_preview": permission.preview,
             # Untruncated: prefer the "Full command" row Kiro ships on
-            # ``_meta.trustOptions`` (see ``_extract_full_command``) — unlike
-            # ``title``, which Kiro itself truncates once the command runs
-            # long or multi-line, this can't be capped since Kiro's own trust
-            # submenu builds an allow-pattern from it. Also bypasses the
-            # 1024-char content_preview cap (shared by every native-permission
-            # producer, see ``_PREVIEW_MAX``), which was separately cutting
-            # long commands off in the approval dialog before a human ever
-            # saw the rest. The web UI renders this in a scrollable block
-            # that isn't subject to either cap (see ApprovalCard's
-            # ``kiroCommand`` branch) — same technique
-            # ``_codex_command_approval_params`` uses for Codex.
+            # ``_meta.trustOptions`` (see ``_extract_full_command``), then
+            # ``toolCall.rawInput.command`` for requests that skip Kiro's
+            # trust submenu entirely — e.g. a Bedrock/Claude-invoked
+            # ``shell`` tool call, whose ``session/request_permission``
+            # carries no ``_meta`` at all (see ``_extract_raw_input_command``).
+            # Neither has to be capped the way ``title`` is (Kiro itself
+            # truncates that once the command runs long or multi-line):
+            # Kiro's own trust submenu builds an allow-pattern from the
+            # first, and the second is the tool's original untruncated
+            # argument. Also bypasses the 1024-char content_preview cap
+            # (shared by every native-permission producer, see
+            # ``_PREVIEW_MAX``), which was separately cutting long commands
+            # off in the approval dialog before a human ever saw the rest.
+            # The web UI renders this in a scrollable block that isn't
+            # subject to either cap (see ApprovalCard's ``kiroCommand``
+            # branch) — same technique ``_codex_command_approval_params``
+            # uses for Codex.
             "command": permission.full_command or permission.title,
         }
         # Tells the server this prompt also has Kiro's "Trust, always allow
