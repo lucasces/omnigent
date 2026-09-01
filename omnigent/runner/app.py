@@ -8948,18 +8948,6 @@ def create_runner_app(
         if body_type == "approval":
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
-            # TEMP DIAGNOSTIC (restart-bypass investigation): dump the full
-            # inbound approval payload and a caller hint so we can tell a
-            # genuine verdict from a spuriously-synthesized one during a
-            # server restart. Remove after root-causing.
-            _logger.warning(
-                "DIAG approval event: conv=%s full_body=%s headers=%s client=%s",
-                conversation_id,
-                body,
-                dict(request.headers),
-                request.client,
-                extra={"session_id": conversation_id},
-            )
             # ``content`` is the person's answer when the prompt asked for
             # more than consent (an MCP ``requestedSchema``). Dropping it here
             # is what used to make the awaiting caller invent one.
