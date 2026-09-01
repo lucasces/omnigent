@@ -113,6 +113,18 @@ def register_elicitations_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
+        # TEMP DIAGNOSTIC (restart-bypass investigation): identify the caller
+        # hitting the resolve-URL endpoint — user_id, user-agent, and any
+        # non-auth headers that hint at the source. Remove after root-causing.
+        _logger.warning(
+            "DIAG resolve_elicitation called: session=%s elicitation_id=%s "
+            "user_id=%s user_agent=%s body=%s",
+            session_id,
+            elicitation_id,
+            user_id,
+            request.headers.get("user-agent"),
+            body.model_dump(exclude_none=True),
+        )
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
