@@ -142,6 +142,58 @@ def test_parse_permission_request_falls_back_to_title_without_full_command_row()
     assert req.preview == req.title
 
 
+def test_parse_permission_request_uses_raw_input_command_when_meta_is_absent() -> None:
+    """A ``shell`` tool call invoked outside Kiro's native trust flow (e.g. a
+    Bedrock/Claude-invoked agent) ships no ``_meta`` at all, so
+    ``_extract_full_command`` can't help — mirrors the real ACP request
+    captured in production, where ``params`` was just
+    ``{sessionId, toolCall: {toolCallId, title, rawInput}, options}``. The
+    untruncated command must come from ``toolCall.rawInput.command`` instead.
+    """
+    msg = _permission_msg("req-1")
+    del msg["params"]["_meta"]
+    msg["params"]["toolCall"]["title"] = "Running: bash -lc '...truncated by kiro...'"
+    msg["params"]["toolCall"]["rawInput"] = {
+        "command": "bash -lc 'echo one\necho two\necho THIS_IS_THE_FULL_COMMAND'"
+    }
+
+    req = parse_permission_request(msg)
+
+    assert req is not None
+    assert req.full_command == "bash -lc 'echo one\necho two\necho THIS_IS_THE_FULL_COMMAND'"
+    assert req.preview == req.full_command
+
+
+def test_parse_permission_request_prefers_trust_options_over_raw_input_command() -> None:
+    msg = _permission_msg("req-1")
+    msg["params"]["_meta"] = {
+        "trustOptions": [{"label": "Full command", "display": "from-trust-options"}]
+    }
+    msg["params"]["toolCall"]["rawInput"] = {"command": "from-raw-input"}
+
+    req = parse_permission_request(msg)
+
+    assert req is not None
+    assert req.full_command == "from-trust-options"
+
+
+def test_parse_permission_request_ignores_raw_input_without_command_field() -> None:
+    """``rawInput`` on non-shell tool calls (e.g. a file edit) has no
+    ``command`` key — the raw-input fallback must not misfire for those and
+    should leave ``full_command`` unset so callers still fall back to
+    ``title``.
+    """
+    msg = _permission_msg("req-1")
+    del msg["params"]["_meta"]
+    msg["params"]["toolCall"]["rawInput"] = {"path": "/tmp/foo.txt", "content": "..."}
+
+    req = parse_permission_request(msg)
+
+    assert req is not None
+    assert req.full_command is None
+    assert req.preview == req.title
+
+
 def test_parse_permission_request_captures_subagent_session_id() -> None:
     req = parse_permission_request(_permission_msg("req-1"))
 
