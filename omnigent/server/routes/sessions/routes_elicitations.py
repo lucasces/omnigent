@@ -114,14 +114,23 @@ def register_elicitations_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         # TEMP DIAGNOSTIC (restart-bypass investigation): identify the caller
-        # hitting the resolve-URL endpoint — user_id, user-agent, and any
-        # non-auth headers that hint at the source. Remove after root-causing.
+        # hitting the resolve-URL endpoint — user_id, referer/origin (which
+        # UI surface issued the request: /inbox vs /c/<parent> vs
+        # /c/<child> vs /approve/<id>/<eid>), and a few other headers that
+        # can hint at an automated (non-browser-click) origin. Remove after
+        # root-causing.
         _logger.warning(
             "DIAG resolve_elicitation called: session=%s elicitation_id=%s "
-            "user_id=%s user_agent=%s body=%s",
+            "user_id=%s referer=%s origin=%s sec_fetch_site=%s sec_fetch_mode=%s "
+            "x_omnigent_client=%s user_agent=%s body=%s",
             session_id,
             elicitation_id,
             user_id,
+            request.headers.get("referer"),
+            request.headers.get("origin"),
+            request.headers.get("sec-fetch-site"),
+            request.headers.get("sec-fetch-mode"),
+            request.headers.get("x-omnigent-client"),
             request.headers.get("user-agent"),
             body.model_dump(exclude_none=True),
         )
