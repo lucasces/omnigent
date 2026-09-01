@@ -8,9 +8,24 @@
 # Ported from, and deliberately narrower than, xtga/agtx's
 # permissions/*.toml presets: only commands that cannot mutate the
 # filesystem, mutate the network, or execute arbitrary code are included.
+#
+# `find`, `sed`, and `awk` are guarded entries: a mapping with `pattern` and
+# `guard` instead of a plain token list. Unlike a plain entry, a prefix
+# match alone is NOT sufficient — a CEL expression (see `_compile_guard` /
+# `_GUARD_FACT_EXTRACTORS` in shell_readonly.py) is evaluated against the
+# full argv (and, for sed/awk, Python-derived facts about the script-text
+# operand) and must return `false` (not dangerous) for the command to be
+# allowed. This exists because these three commands' write/exec vectors
+# (`-exec`/`-delete`, `-i`/embedded `w`·`e`, `system()`/redirects) are not
+# confined to a fixed prefix position — see
+# docs/shell-readonly-allowlist-audit.md §5-§6 for why a plain prefix
+# pattern cannot do this safely. Residual risk (enumeration gaps, shell
+# expansion, regex heuristics over script text) is documented at
+# `_GUARD_FACT_EXTRACTORS` and is NOT eliminated, only mitigated with an
+# ASK fallback on anything ambiguous.
+#
 # Excluded on purpose, even where agtx allows them:
-#   - core: find, sed, awk (can execute via -exec / -i / system()); rm, mv,
-#     cp, mkdir (mutate the filesystem)
+#   - core: rm, mv, cp, mkdir (mutate the filesystem)
 #   - git: add, commit, push, merge, checkout, stash, branch (all mutate
 #     the repo or working tree; `branch` can delete/rename with -d/-D/-m)
 #   - node: bare `node` (runs arbitrary scripts), npm/yarn install/run/build
@@ -40,6 +55,18 @@ core:
     - [which]
     - [env]
     - [pwd]
+    - pattern: [find]
+      guard: >-
+        tokens.exists(t, t in ["-exec", "-execdir", "-ok", "-okdir",
+        "-delete", "-fprintf", "-fprint", "-fprint0", "-fls"])
+    - pattern: [sed]
+      guard: >-
+        facts.has_inplace || facts.has_external_script ||
+        facts.has_write_command || facts.has_execute_flag
+    - pattern: [awk]
+      guard: >-
+        facts.has_inplace || facts.has_external_script ||
+        facts.has_redirect || facts.has_system_call
 
 git:
   description: Read-only git inspection commands
