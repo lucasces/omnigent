@@ -964,6 +964,26 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
+            # TEMP DIAGNOSTIC (restart-bypass investigation): this is the
+            # OTHER entry point that converges on _resolve_elicitation
+            # (native Claude Code permission cards may resolve through
+            # here rather than the dedicated resolve-URL endpoint). Same
+            # fields as the URL endpoint's DIAG log. Remove after
+            # root-causing.
+            _logger.warning(
+                "DIAG post_event approval: session=%s data=%s "
+                "user_id=%s referer=%s origin=%s sec_fetch_site=%s sec_fetch_mode=%s "
+                "x_omnigent_client=%s user_agent=%s",
+                session_id,
+                body.data,
+                user_id,
+                request.headers.get("referer"),
+                request.headers.get("origin"),
+                request.headers.get("sec-fetch-site"),
+                request.headers.get("sec-fetch-mode"),
+                request.headers.get("x-omnigent-client"),
+                request.headers.get("user-agent"),
+            )
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
