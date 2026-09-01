@@ -997,6 +997,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const p = params as Record<string, unknown>;
     const requestedSchema = p.requestedSchema;
     const targetSessionId = p.target_session_id;
+    const targetSessionLabel = p.target_session_label;
     const phase = String(p.phase ?? "");
     const policyName = String(p.policy_name ?? "");
     // The PermissionRequest endpoint stamps an `ask_user_question`
@@ -1068,6 +1069,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,
+      targetSessionLabel:
+        typeof targetSessionLabel === "string" && targetSessionLabel ? targetSessionLabel : null,
       message: String(p.message ?? ""),
       requestedSchema:
         requestedSchema && typeof requestedSchema === "object" && !Array.isArray(requestedSchema)

@@ -905,6 +905,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
             : ctx(state),
         elicitationId: event.elicitationId,
         targetSessionId: event.targetSessionId,
+        targetSessionLabel: event.targetSessionLabel,
         message: event.message,
         phase: event.phase,
         policyName: event.policyName,

@@ -66,20 +66,28 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       // send path is separately gated while a prompt is pending).
       if (isDraftingTarget(e.target)) return;
 
-      const { blocks, submitApproval } = useChatStore.getState();
+      const { blocks, conversationId, submitApproval } = useChatStore.getState();
       // Newest-first: accept the most recent still-pending prompt that takes a
-      // plain verdict. Skip AskUserQuestion (needs an explicit choice).
+      // plain verdict. Skip AskUserQuestion (needs an explicit choice) and any
+      // elicitation whose requestedSchema still needs values filled in. Also
+      // skip prompts mirrored in from a sub-agent session (targetSessionId
+      // set to something other than the session being viewed) — the hotkey
+      // must only ever act on this chat's own prompts, mirroring the same
+      // per-session guard ChatPage's hasPendingElicitation check uses.
       // The newest pending prompt is the one on screen. Searching past it for
       // an older binary one would accept something the person cannot see while
       // they are filling in a form.
-      const newest = [...blocks]
+      const pending = [...blocks]
         .reverse()
-        .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
-      if (!newest) return;
-      const takesAPlainVerdict =
-        !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
-      if (!takesAPlainVerdict) return;
-      const pending = newest;
+        .find(
+          (b): b is ElicitationBlock =>
+            b.type === "elicitation" &&
+            b.status === "pending" &&
+            !b.askUserQuestion &&
+            schemaFields(b.requestedSchema).length === 0 &&
+            (b.targetSessionId == null || b.targetSessionId === conversationId),
+        );
+      if (!pending) return;
 
       // Intercept before the composer's Enter-to-send handler runs.
       e.preventDefault();

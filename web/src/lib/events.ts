@@ -185,6 +185,14 @@ export interface ElicitationRequest {
    * a sub-agent prompt into its parent chat.
    */
   targetSessionId?: string | null;
+  /**
+   * Human-readable label for `targetSessionId` (e.g. the sub-agent's
+   * `"<type>:<name>"` title), so a mirrored card can be marked with
+   * its true origin instead of rendering identically to a
+   * first-party prompt. `null`/absent when `targetSessionId` is
+   * unset or the origin session has no label.
+   */
+  targetSessionLabel?: string | null;
   message: string;
   /** A restricted subset of JSON Schema. Empty `{}` for binary approve/reject. */
   requestedSchema: Record<string, unknown>;
