@@ -1742,6 +1742,15 @@ async def _resolve_elicitation(
     # malformed body. A missing id degrades gracefully below (no Future
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
+    # TEMP DIAGNOSTIC (restart-bypass investigation): log every resolution
+    # attempt with its full payload so a spurious/synthesized verdict during
+    # a server restart is distinguishable from a genuine one. Remove after
+    # root-causing.
+    _logger.warning(
+        "DIAG _resolve_elicitation called: session=%s data=%s",
+        session_id,
+        data,
+    )
     elicitation_id = data.get("elicitation_id", "")
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
