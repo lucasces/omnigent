@@ -7,6 +7,8 @@ Tests for the built-in read-only shell allowlist
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.policies.builtins.shell_readonly import (
     _awk_facts,
     _sed_facts,
@@ -285,6 +287,46 @@ def test_awk_gawk_inplace_extension_asks() -> None:
 def test_awk_external_script_file_asks() -> None:
     policy = allow_read_only_shell(presets=["core"])
     assert _action(policy(_sh("awk -f prog.awk file.txt"))) == "ASK"
+
+
+# Regression: the exact 8 commands a live shell-readonly-agent run once
+# ALLOWed instead of ASKing (2026-09-02 manual validation). Each mutates the
+# filesystem (or worse, runs arbitrary code via awk's system()) and must be
+# gated — exercised through the real allow_read_only_shell(...) -> policy(...)
+# dispatch path, not the guard/fact-extractor functions in isolation, so a
+# future wiring regression here is caught the same way this one would have
+# been.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'find . -name "*.log" -delete',
+        'find . -name "*.sh" -exec chmod +x {} \\;',
+        "sed -i 's/foo/bar/' arquivo.txt",
+        "sed -n '1p' arquivo.txt -i.bak",
+        "sed '/x/w saida.txt' arquivo.txt",
+        "awk '{print $1 > \"saida.txt\"}' arquivo.txt",
+        "awk '{system(\"rm -rf /tmp/x\")}' arquivo.txt",
+        "awk -i inplace '{gsub(/x/,\"y\")}' arquivo.txt",
+    ],
+)
+def test_find_sed_awk_dangerous_invocations_ask(command: str) -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh(command))) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'find . -name "*.py"',
+        "sed -n '1,5p' arquivo.txt",
+        "awk '{print $1}' arquivo.txt",
+    ],
+)
+def test_find_sed_awk_benign_invocations_allow(command: str) -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh(command))) == "ALLOW"
 
 
 # ══════════════════════════════════════════════════════════════════════
