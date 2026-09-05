@@ -713,6 +713,15 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
 # cover (custom gateway vars, `providers:`-config `env:` refs, exotic
 # SDK knobs). Operator-controlled: the host owner names exactly what
 # their runners need; everything unnamed stays behind the allowlist.
+#
+# Second hop: some harnesses spawn their own vendor-CLI subprocess with a
+# further filtered environment rather than inheriting the runner's (e.g.
+# opencode-native's `opencode serve`, filtered in
+# `omnigent.opencode_native_app_server.filtered_server_env`). Those
+# harnesses re-read this same var out of their own (already-forwarded)
+# environment, so a name added here for the host→runner hop also reaches
+# that inner subprocess — one operator-facing knob instead of a second one
+# per harness.
 RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
 
 # HTTP statuses on the WebSocket upgrade that are worth retrying. Everything

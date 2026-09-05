@@ -145,6 +145,26 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+def test_filtered_server_env_honors_runner_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A name listed in OMNIGENT_RUNNER_ENV_PASSTHROUGH reaches the subprocess.
+
+    The var already governs what the host forwards into the runner process
+    (omnigent.host.connect); an operator naming a custom provider credential
+    there (e.g. ARK_API_KEY for a byteplus-plan provider referenced via
+    ``{env:ARK_API_KEY}`` in opencode.json) expects it to reach ``opencode
+    serve`` too, not just the runner process that spawns it.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "ARK_API_KEY,OTHER_NAME")
+    monkeypatch.setenv("ARK_API_KEY", "ark-secret")
+    monkeypatch.setenv("UNNAMED_SECRET", "nope")
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+    assert env["ARK_API_KEY"] == "ark-secret"
+    assert "UNNAMED_SECRET" not in env  # not named in the passthrough var
+    assert "OTHER_NAME" not in env  # named but unset upstream, so absent
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(

@@ -94,6 +94,27 @@ _ENV_OPENCODE_CONFIG_DENYLIST = frozenset(
     }
 )
 
+# The same operator-controlled var that governs what the host forwards into
+# the runner process (see ``omnigent.host.connect.RUNNER_ENV_PASSTHROUGH_ENV_VAR``
+# / ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``). Re-read here so a name an operator
+# added there for a provider credential the built-in families above don't
+# cover (e.g. a custom ``api_key_ref: env:ARK_API_KEY`` in the user's OpenCode
+# provider config) also reaches the ``opencode serve`` subprocess, instead of
+# stopping at the runner process that spawns it.
+_RUNNER_ENV_PASSTHROUGH_ENV_VAR = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
+
+
+def _operator_passthrough_names() -> tuple[str, ...]:
+    """Extra env var names named in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``.
+
+    Comma-separated names only — the value itself is read from this
+    process's own environment (which already has it, since the host
+    forwards the var host->runner alongside whatever it names).
+    """
+    raw = os.environ.get(_RUNNER_ENV_PASSTHROUGH_ENV_VAR, "")
+    return tuple(name.strip() for name in raw.split(",") if name.strip())
+
+
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 # Strip ANSI escape sequences from ``opencode models`` output.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -349,6 +370,7 @@ def filtered_server_env(
         if name.strip()
     }
     env: dict[str, str] = {}
+    extra_names = _operator_passthrough_names()
     for key, value in os.environ.items():
         if key in _ENV_OPENCODE_CONFIG_DENYLIST:
             # Never inherit the parent's global OpenCode config — the
