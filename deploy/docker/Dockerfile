@@ -257,10 +257,14 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # (the binary/package map `omnigent setup` installs from) — keep the
 # two in sync. Unpinned on purpose: the official image is rebuilt by
 # CI, so it tracks the same "latest" a laptop install would get.
+# opencode-ai is the exception: its npm "latest" resolves to a
+# 0.0.0-beta pre-release the runtime version check rejects, so it's
+# pinned to the same ~1.18.0 range as harness_install.py.
 RUN npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
       @earendil-works/pi-coding-agent \
+      opencode-ai@~1.18.0 \
  && npm cache clean --force
 
 # Kiro CLI is not published as an npm package, and its installer has NO version
