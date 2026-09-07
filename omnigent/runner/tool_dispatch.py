@@ -3109,6 +3109,8 @@ def _build_session_create_body(
     message: object,
     model: object = None,
     reasoning_effort: object = None,
+    host_type: object = None,
+    sandbox_provider: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -3116,15 +3118,16 @@ def _build_session_create_body(
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
     top-level or sibling session). A non-empty ``title``, ``message``,
-    ``model``, and ``reasoning_effort`` are included when provided; the
-    message becomes the child's first queued user turn via
-    ``initial_items``.
+    ``model``, ``reasoning_effort``, ``host_type``, and
+    ``sandbox_provider`` are included when provided; the message becomes
+    the child's first queued user turn via ``initial_items``.
 
-    ``model`` and ``reasoning_effort`` are passed through unvalidated:
-    this path never resolves the child's harness (the agent is named by
-    id and resolved server-side), so neither can be checked against the
-    harness's capabilities here. The server validates both against their
-    vocabularies at create.
+    ``model``, ``reasoning_effort``, ``host_type``, and
+    ``sandbox_provider`` are passed through unvalidated: this path never
+    resolves the child's harness or sandbox config here. The server
+    validates all four against their vocabularies at create (e.g.
+    rejecting an unconfigured ``sandbox_provider`` or a
+    ``sandbox_provider`` set without ``host_type: "managed"``).
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -3136,6 +3139,11 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
+    :param host_type: Optional host mode, ``"external"`` or
+        ``"managed"``; omitted (server default ``"external"``) when not
+        a non-empty string.
+    :param sandbox_provider: Optional sandbox provider to provision when
+        ``host_type`` is ``"managed"``, e.g. ``"kubernetes"``.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -3148,6 +3156,10 @@ def _build_session_create_body(
         body["model_override"] = model
     if isinstance(reasoning_effort, str) and reasoning_effort:
         body["reasoning_effort"] = reasoning_effort
+    if isinstance(host_type, str) and host_type:
+        body["host_type"] = host_type
+    if isinstance(sandbox_provider, str) and sandbox_provider:
+        body["sandbox_provider"] = sandbox_provider
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -3315,6 +3327,8 @@ async def _execute_session_create(
         args.get("message"),
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
+        host_type=args.get("host_type"),
+        sandbox_provider=args.get("sandbox_provider"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3454,7 +3468,8 @@ async def _upload_config_bundle(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title``.
+    :param args: Parsed tool arguments; optional ``title``, ``host_type``,
+        and ``sandbox_provider``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param agent_spec: The calling agent's spec, for os_env resolution.
@@ -3481,6 +3496,12 @@ async def _upload_config_bundle(
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
+    host_type = args.get("host_type")
+    if isinstance(host_type, str) and host_type:
+        metadata["host_type"] = host_type
+    sandbox_provider = args.get("sandbox_provider")
+    if isinstance(sandbox_provider, str) and sandbox_provider:
+        metadata["sandbox_provider"] = sandbox_provider
     try:
         resp = await server_client.post(
             "/v1/sessions",

@@ -926,8 +926,12 @@ class SysSessionCreateTool(Tool):
             "with sys_os_write) and launches it. Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
-            "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions). "
+            "message. Optionally set host_type='managed' (with an "
+            "optional sandbox_provider, e.g. 'kubernetes') to have the "
+            "server provision a sandbox host for the child instead of "
+            "co-locating it on your own runner. The new session is "
+            "always a child of the calling session (you cannot create "
+            "top-level or sibling sessions). "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
@@ -1020,6 +1024,32 @@ class SysSessionCreateTool(Tool):
                                 "'agent_id', and only for harnesses with "
                                 "effort plumbing; omit to use the agent's "
                                 "default."
+                            ),
+                        },
+                        "host_type": {
+                            "type": "string",
+                            "enum": ["external", "managed"],
+                            "description": (
+                                "Optional host mode for the child session. "
+                                "'external' (the default) runs it on the "
+                                "caller's own runner, co-located with this "
+                                "session. 'managed' has the server "
+                                "provision a sandbox host (e.g. a "
+                                "kubernetes pod) from its configured "
+                                "sandbox providers instead — provisioning "
+                                "happens in the background after create. "
+                                "Omit for the existing co-located behavior."
+                            ),
+                        },
+                        "sandbox_provider": {
+                            "type": "string",
+                            "description": (
+                                "Optional sandbox provider to provision "
+                                "when host_type is 'managed', e.g. "
+                                "'kubernetes' — one of the server's "
+                                "configured sandbox providers. Only valid "
+                                "with host_type 'managed'; omit to use "
+                                "the server's first configured provider."
                             ),
                         },
                     },
