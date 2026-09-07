@@ -28,7 +28,10 @@ recursively — so the allowlist cannot be bypassed by chaining, wrapping, or
 nesting. Output redirection (``>``, ``>>``, ``2>file``) and process
 substitution (``<(...)``, ``>(...)``) disqualify a segment from the
 allowlist even when the base command matches, since either can turn a
-"read-only" command into a write or arbitrary-code execution.
+"read-only" command into a write or arbitrary-code execution — except for a
+trailing redirect that provably writes nowhere (``> /dev/null``, ``2>&1``,
+``&>/dev/null``, ...), which is still treated as read-only (see
+``_has_unsafe_shell_syntax``).
 
 **Interaction with ``ask_on_os_tools``**: :func:`omnigent.policies.builtins.
 safety.ask_on_os_tools` ASKs unconditionally for every shell/file tool call,
@@ -94,13 +97,47 @@ def _has_unsafe_shell_syntax(segment: str) -> bool:
     intentionally conservative: a false positive only costs an extra ASK, it
     never produces a silent ALLOW.
 
+    The one carve-out is a trailing run of redirects that provably write
+    nowhere: discarding output to ``/dev/null`` (``>``, ``>>``, ``1>``,
+    ``2>``, ``&>``, ...) or merging one fd into another with no file operand
+    (``2>&1``, ``1>&2``). Those are stripped from the *end* of the segment
+    (see :data:`_TRAILING_BENIGN_REDIRECTS`) before the substring check runs,
+    so ``grep -n foo file.txt > /dev/null`` is safe but ``grep -n foo
+    file.txt > out.txt`` still isn't — same for anything where the redirect
+    isn't the last thing on the line (embedded ``>`` inside a sed/awk script
+    operand, ``> /dev/null; rm -rf /`` after the ``;`` splitter has already
+    broken it into its own segment, or a target that only looks like
+    ``/dev/null`` — ``/dev/nullx``, ``./dev/null`` — none of those match the
+    anchored pattern and still fall through to the raw substring check).
+
     :param segment: A single command segment (already split on chaining
         operators), e.g. ``"cat secret.txt > /tmp/x"``.
-    :returns: ``True`` if the segment contains ``>`` (covers ``>``, ``>>``,
-        ``N>``, ``&>``, and the ``>(`` process-substitution form) or ``<(``
-        (input process substitution).
+    :returns: ``True`` if, after stripping trailing benign redirects, the
+        segment still contains ``>`` (covers ``>``, ``>>``, ``N>``, ``&>``,
+        and the ``>(`` process-substitution form) or ``<(`` (input process
+        substitution).
     """
-    return ">" in segment or "<(" in segment
+    without_benign_redirects = _TRAILING_BENIGN_REDIRECTS.sub("", segment)
+    return ">" in without_benign_redirects or "<(" in without_benign_redirects
+
+
+# A single redirect clause that writes nowhere: stdout/stderr (optionally
+# both, via `&>`) discarded to /dev/null, or one fd merged into another with
+# no file operand at all (`2>&1`, `1>&2`). `[12]?` covers bare `>` (stdout),
+# explicit `1>` (stdout), and `2>` (stderr); `{1,2}` covers both `>` and the
+# append form `>>`.
+_BENIGN_REDIRECT_CLAUSE = r"(?:&>{1,2}|[12]?>{1,2})\s*/dev/null|2>&1|1>&2"
+
+# Matches one or more benign redirect clauses anchored to the END of the
+# segment, each preceded by whitespace that separates it from the previous
+# word. Anchoring to `$` is what rejects `/dev/nullx` (leftover `x` before
+# the anchor breaks the match) and `./dev/null` (the literal `/dev/null`
+# text doesn't start right after the operator's whitespace) without needing
+# a manual lookahead/lookbehind. Requiring a `;`/`&&`/`|`-splitter to have
+# already separated anything after the redirect means a smuggled command
+# after it (`> /dev/null; rm -rf /`) never reaches this regex as part of the
+# same segment in the first place.
+_TRAILING_BENIGN_REDIRECTS = re.compile(rf"(?:\s+(?:{_BENIGN_REDIRECT_CLAUSE}))+\s*$")
 
 
 # ── Full-argv CEL guards ─────────────────────────────────────────────────

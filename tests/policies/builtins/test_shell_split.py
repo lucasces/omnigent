@@ -37,6 +37,22 @@ def test_lone_background_ampersand_still_splits() -> None:
     assert split_command_segments("echo hi & git push") == ["echo hi", "git push"]
 
 
+def test_fd_merge_ampersand_is_not_a_chain_operator() -> None:
+    """Regression test: `&` glued to `>` (fd-dup / merged-stream redirects)
+    must stay part of the segment, not be mistaken for the background/
+    chaining `&` and shredded into nonsense pieces (`ls 2>` + `1`)."""
+    assert split_command_segments("ls 2>&1") == ["ls 2>&1"]
+    assert split_command_segments("ls 1>&2") == ["ls 1>&2"]
+    assert split_command_segments("ls > /dev/null 2>&1") == ["ls > /dev/null 2>&1"]
+    assert split_command_segments("ls &> /dev/null") == ["ls &> /dev/null"]
+
+
+def test_fd_merge_ampersand_does_not_hide_a_chained_command() -> None:
+    """A real background/chain `&` right after an fd-merge redirect must
+    still split — only the `&` glued to `<`/`>` is exempted."""
+    assert split_command_segments("ls 2>&1 & git push") == ["ls 2>&1", "git push"]
+
+
 def test_unterminated_quote_does_not_crash_and_merges_to_one_segment() -> None:
     """A malformed / unterminated quote is treated as extending to the end
     of the string rather than raising — fail-closed, since the merged

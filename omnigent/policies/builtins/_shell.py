@@ -234,6 +234,12 @@ def split_command_segments(command: str) -> list[str]:
     (``echo hi & git push`` would be one un-split segment whose head is
     ``echo``, slipping the ``git push`` past detection).
 
+    An ``&`` immediately glued to a ``<``/``>`` is a redirect operator, not
+    the background separator, and is never split on: ``2>&1`` (fd-dup) and
+    ``&>file`` (merged-stream redirect) must stay attached to their command,
+    or ``ls 2>&1`` would shred into the nonsense segments ``ls 2>`` and
+    ``1``.
+
     :param command: The raw shell command string, e.g.
         ``"cd /repo && npm test"``.
     :returns: List of trimmed, non-empty segments, e.g.
@@ -295,6 +301,15 @@ def _split_unquoted(command: str) -> list[str]:
             parts.append("".join(current))
             current = []
             i += 2
+            continue
+        if ch == "&" and (
+            (current and current[-1] in "<>") or (i + 1 < n and command[i + 1] == ">")
+        ):
+            # `&` glued to `<`/`>` is a redirect operator (`N>&M` fd-dup,
+            # `&>file` merged-stream redirect), not the background/separator
+            # `&` — splitting here would shred `2>&1` into `2>` and `1`.
+            current.append(ch)
+            i += 1
             continue
         if ch in ";|\n&":
             parts.append("".join(current))
