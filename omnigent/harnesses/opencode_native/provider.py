@@ -454,6 +454,67 @@ def _strip_trailing_commas(text: str) -> str:
     return "".join(result)
 
 
+# Environment variable carrying a JSON-encoded opencode provider config, for
+# hosts where the ambient ``~/.config/opencode/opencode.json`` is unreachable
+# (e.g. a Kubernetes sandbox Job runs the runner *inside* the container,
+# which has no access to the user's local dotfiles). Sandbox operators set
+# this to the same ``provider``/``model`` JSON they'd otherwise keep in that
+# file.
+_ENV_PROVIDER_CONFIG_VAR = "OMNIGENT_OPENCODE_PROVIDER_CONFIG"
+
+
+def maybe_merge_env_provider_config(config: dict[str, object]) -> dict[str, object]:
+    """
+    Merge a JSON provider config supplied via ``OMNIGENT_OPENCODE_PROVIDER_CONFIG``.
+
+    Mirrors :func:`maybe_merge_user_provider_config`, but reads from an
+    environment variable instead of the ambient ``~/.config/opencode``
+    dotfile. Sandbox launchers (e.g. the Kubernetes Job provider) use this to
+    supply a custom OpenAI-compatible provider (base URL + API key env
+    reference) when the runner has no access to the user's real home
+    directory: an API key env var like ``ARK_API_KEY`` reaching the container
+    is not sufficient on its own — without a provider block naming the right
+    base URL, opencode falls back to its own built-in default endpoint for
+    that key's env-var name, which may not match the account's actual
+    endpoint/region and fails auth even though the key itself is valid.
+
+    :param config: The synthesized config dict (may be empty).
+    :returns: *config* with the env-supplied ``provider`` entries (and, if
+        unset, its default ``model``) merged in.
+    """
+    raw = os.environ.get(_ENV_PROVIDER_CONFIG_VAR, "").strip()
+    if not raw:
+        return config
+
+    try:
+        env_config = json.loads(raw)
+    except json.JSONDecodeError:
+        _logger.warning(
+            "Failed to parse %s as JSON — ignoring env provider config",
+            _ENV_PROVIDER_CONFIG_VAR,
+        )
+        return config
+
+    if not isinstance(env_config, dict):
+        return config
+
+    result = dict(config)
+    env_providers = env_config.get("provider")
+    if isinstance(env_providers, dict) and env_providers:
+        existing = result.get("provider")
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        for key, value in env_providers.items():
+            merged.setdefault(key, value)
+        result["provider"] = merged
+        result.setdefault("$schema", "https://opencode.ai/config.json")
+
+    env_model = env_config.get("model")
+    if isinstance(env_model, str) and env_model:
+        result.setdefault("model", env_model)
+
+    return result
+
+
 def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
     """
     Merge the user's global OpenCode provider definitions into *config*.

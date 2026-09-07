@@ -1255,6 +1255,7 @@ async def _auto_create_opencode_terminal(
         build_opencode_model_default_config,
         build_opencode_omnigent_mcp_server,
         build_opencode_provider_config,
+        maybe_merge_env_provider_config,
         maybe_merge_user_provider_config,
         resolve_databricks_gateway,
         write_opencode_provider_config,
@@ -1335,6 +1336,12 @@ async def _auto_create_opencode_terminal(
     # spawned server sees both. The per-session XDG_CONFIG_HOME override
     # hides the user's ~/.config/opencode/opencode.jsonc, so without this
     # merge, custom providers with non-default base URLs are invisible.
+    # Sandbox launchers (e.g. the Kubernetes Job provider) have no access to
+    # the user's real ~/.config/opencode dotfile since the runner executes
+    # inside the container itself; they pass a custom provider via
+    # OMNIGENT_OPENCODE_PROVIDER_CONFIG instead. Env takes precedence over the
+    # (normally absent, in that case) ambient user file merge below.
+    config = maybe_merge_env_provider_config(config)
     config = maybe_merge_user_provider_config(config)
 
     if config:
