@@ -7563,6 +7563,50 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_persists_host_type_and_sandbox_provider() -> None:
+    """
+    ``sys_session_create`` threads ``host_type`` and ``sandbox_provider``
+    onto the create body, so a self-spawned child can opt into a
+    server-provisioned sandbox (e.g. a kubernetes pod) instead of the
+    default co-located runner. Passed through unvalidated — the server
+    enforces the ``host_type``/``sandbox_provider`` vocabulary at create.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_child",
+                    "agent_id": "ag_x",
+                    "agent_name": "researcher",
+                    "status": "idle",
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"agent_id": "ag_x", "host_type": "managed", "sandbox_provider": "kubernetes"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["host_type"] == "managed"
+    assert captured["sandbox_provider"] == "kubernetes"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -7714,6 +7758,56 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # not the caller's args — the orchestrator needs the NEW agent's id.
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_bundle_mode_persists_host_type_and_sandbox_provider(
+    tmp_path: Path,
+) -> None:
+    """
+    Bundle mode threads ``host_type``/``sandbox_provider`` into the
+    multipart ``metadata`` part, mirroring the ``agent_id`` JSON path,
+    so a freshly-uploaded agent can also launch on a managed sandbox.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: do helpful things\n")
+
+    create_requests: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_requests.append(request)
+            return httpx.Response(
+                201,
+                json={"session_id": "conv_child", "agent_id": "ag_new", "agent_name": "helper"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "config_path": "helper.yaml",
+                    "host_type": "managed",
+                    "sandbox_provider": "kubernetes",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    parts = _parse_multipart_create(create_requests[0])
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "host_type": "managed",
+        "sandbox_provider": "kubernetes",
+    }
 
 
 @pytest.mark.asyncio
