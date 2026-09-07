@@ -11,6 +11,7 @@ import pytest
 
 from omnigent.policies.builtins.shell_readonly import (
     _awk_facts,
+    _has_unsafe_shell_syntax,
     _sed_facts,
     allow_read_only_shell,
     list_read_only_presets,
@@ -157,6 +158,121 @@ def test_unresolved_wrapper_flag_asks() -> None:
     result = policy(_sh("sudo -u root cat /etc/shadow"))
     # sudo -u is modeled by _shell.py and skips to "cat" — still safe.
     assert _action(result) == "ALLOW"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Benign redirects (/dev/null sinks, fd merges) don't disqualify
+# ════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "grep -n foo file.txt > /dev/null",
+        "grep -n foo file.txt >> /dev/null",
+        "grep -n foo file.txt 1> /dev/null",
+        "grep -n foo file.txt 1>> /dev/null",
+        "grep -n foo file.txt 2>/dev/null",
+        "grep -n foo file.txt 2>>/dev/null",
+        "grep -n foo file.txt &> /dev/null",
+        "grep -n foo file.txt &>> /dev/null",
+        "grep -n foo file.txt > /dev/null 2>&1",
+        "grep -n foo file.txt 2>&1",
+        "grep -n foo file.txt 1>&2",
+    ],
+)
+def test_has_unsafe_shell_syntax_allows_benign_redirect(segment: str) -> None:
+    assert _has_unsafe_shell_syntax(segment) is False
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "grep -n foo file.txt > saida.txt",
+        "grep -n foo file.txt >> log.txt",
+        "grep -n foo file.txt > /dev/nullx",
+        "grep -n foo file.txt > /dev/null2",
+        "grep -n foo file.txt > ./dev/null",
+        "grep -n foo file.txt > /dev/null*",
+        "grep -n foo file.txt > /dev/null; rm -rf /",
+        "cat secret.txt > /tmp/leak",
+        "diff <(rm -rf /) <(echo hi)",
+    ],
+)
+def test_has_unsafe_shell_syntax_still_flags_real_writes(segment: str) -> None:
+    assert _has_unsafe_shell_syntax(segment) is True
+
+
+def test_grep_redirected_to_dev_null_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("grep -n foo arquivo.txt > /dev/null"))) == "ALLOW"
+
+
+def test_grep_redirected_to_real_file_still_asks() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    result = policy(_sh("grep -n foo arquivo.txt > saida.txt"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_find_without_exec_redirected_to_dev_null_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("find . -name *.py 2>/dev/null"))) == "ALLOW"
+
+
+def test_find_with_exec_redirected_to_dev_null_still_asks() -> None:
+    """The dangerous -exec guard still fires regardless of the redirect."""
+    policy = allow_read_only_shell(presets=["core"])
+    result = policy(_sh("find / -exec rm -rf {} + 2>/dev/null"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_sed_without_inplace_redirected_to_dev_null_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("sed s/foo/bar/ file.txt > /dev/null"))) == "ALLOW"
+
+
+def test_sed_inplace_redirected_to_dev_null_still_asks() -> None:
+    """The in-place-editing guard still fires regardless of the redirect."""
+    policy = allow_read_only_shell(presets=["core"])
+    result = policy(_sh("sed -i s/foo/bar/ file.txt 2>/dev/null"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_awk_redirected_to_dev_null_allows() -> None:
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("awk {print} file.txt &> /dev/null"))) == "ALLOW"
+
+
+def test_awk_with_embedded_write_redirect_in_script_still_asks() -> None:
+    """A `>` inside the awk program text is a real awk redirect, not a
+    trailing shell one - it must keep asking even though it superficially
+    resembles the benign-redirect carve-out."""
+    policy = allow_read_only_shell(presets=["core"])
+    result = policy(_sh("awk '{print > \"file\"}' input.txt"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_dev_null_redirect_then_chained_unsafe_command_still_asks() -> None:
+    """The `;` splitter isolates the dangerous half into its own segment
+    before the benign-redirect carve-out ever sees it."""
+    policy = allow_read_only_shell(presets=["core"])
+    result = policy(_sh("cat file.txt > /dev/null; rm -rf /"))
+    assert result is not None
+    assert result["result"] == "ASK"
+
+
+def test_ampersand_fd_merge_not_shredded_by_segment_splitter() -> None:
+    """Regression: `&` glued to `>` (2>&1, &>file) is a redirect operator,
+    not the background/chaining `&` - splitting on it used to shred
+    `ls 2>&1` into the nonsense segments `ls 2>` and `1`."""
+    policy = allow_read_only_shell(presets=["core"])
+    assert _action(policy(_sh("ls 2>&1"))) == "ALLOW"
+    assert _action(policy(_sh("ls 1>&2"))) == "ALLOW"
+    assert _action(policy(_sh("ls &> /dev/null"))) == "ALLOW"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
