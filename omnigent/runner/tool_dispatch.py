@@ -5206,6 +5206,13 @@ async def _agent_list_fetch(
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
         if after is not None:
             params["after"] = after
+        # sys_agent_list is an agent-facing tool, not the Web UI's
+        # new-session picker: a coordinator (e.g. `home`) must still
+        # be able to resolve a `hidden: true` sub-agent's id by name,
+        # so always ask for the unfiltered /v1/agents set. No-op for
+        # /v1/sessions (unknown query params are ignored there).
+        if path == "/v1/agents":
+            params["include_hidden"] = "true"
         resp = await server_client.get(path, params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
         return _DiscoveryPage([], False, failed=True)

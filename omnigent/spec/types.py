@@ -1540,6 +1540,23 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``non-public`` (grant named users only), or ``public`` (also
         allow ``__public__`` anonymous read). **Defaults to
         ``SharePolicy.NONE``.**
+    :param hidden: Whether this built-in/template agent is omitted from
+        the human-facing top-level agent listing (the Web UI's
+        new-session picker and a plain ``GET /v1/agents``). YAML key is
+        ``hidden:`` (top-level boolean). **Defaults to ``False``.**
+        Purely a listing filter, applied in
+        ``omnigent.server.routes.builtin_agents.create_builtin_agents_router``
+        — it has NO effect on launchability: the agent is still fully
+        registered, still resolvable by id, and still reachable via
+        ``sys_session_create(agent_id=...)``. The agent-facing
+        ``sys_agent_list`` tool always asks the server for the
+        unfiltered set (``include_hidden=true``) so a coordinator agent
+        that already knows a hidden sub-agent's name (e.g. ``home``
+        looking up ``homelab-ops``) can still resolve its ``agent_id`` —
+        only the plain query used by the human-facing picker is
+        filtered. Meant for specialist agents a coordinator already
+        dispatches to via ``spawn`` and that make no sense as an
+        independently-selectable top-level agent for a human.
     """
 
     spec_version: int
@@ -1589,4 +1606,6 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    # See the ``hidden`` docstring param above.
+    hidden: bool = False
     source_rel_dir: str | None = field(default=None, compare=False)

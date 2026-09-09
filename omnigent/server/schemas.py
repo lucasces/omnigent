@@ -266,6 +266,13 @@ class AgentObject(BaseModel):
         session snapshot's ``skills`` field carries the merged
         set once a runner is bound. Empty list when the spec
         bundles no skills or when the bundle cannot be loaded.
+    :param hidden: Mirrors ``AgentSpec.hidden`` — ``True`` when this
+        agent declares ``hidden: true`` and should be omitted from a
+        human-facing top-level listing. ``GET /v1/agents`` filters
+        these out by default (see ``include_hidden``); callers that
+        fetch the raw list still see the flag here. Defaults to
+        ``False`` (also the fallback when the bundle can't be
+        loaded, so a broken bundle fails open to visible).
     :param terminals: Terminal names declared in the spec's
         ``terminals:`` block, in declaration order, e.g.
         ``["shell"]``. The Web UI gates its "new terminal"
@@ -300,6 +307,7 @@ class AgentObject(BaseModel):
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
     builtin: bool = False
+    hidden: bool = False
 
 
 # ── Session Policies ───────────────────────────────────────────

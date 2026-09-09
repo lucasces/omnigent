@@ -3171,6 +3171,37 @@ def test_parse_spawn_true_sets_flag(tmp_path: Path) -> None:
     assert spec.spawn is True
 
 
+def test_parse_hidden_defaults_to_false_when_omitted(agent_dir: Path) -> None:
+    """
+    Without a top-level ``hidden:`` key the parsed ``AgentSpec.hidden``
+    is ``False`` \u2014 a built-in is listed by default. A regression
+    flipping this default would silently disappear every existing
+    built-in from the Web UI's new-session picker.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    spec = parse(agent_dir)
+    assert spec.hidden is False
+
+
+def test_parse_hidden_true(tmp_path: Path) -> None:
+    """
+    A top-level ``hidden: true`` round-trips to ``AgentSpec.hidden``.
+
+    This is the only signal ``GET /v1/agents`` uses to drop a built-in
+    from the human-facing listing (see
+    ``omnigent.server.routes.builtin_agents``); a parser regression
+    dropping the field would mean the YAML opt-in has no effect and the
+    agent stays listed.
+
+    :param tmp_path: pytest-provided temporary directory.
+    """
+    config = {"spec_version": 1, "name": "hidden-agent", "hidden": True}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.hidden is True
+
+
 def test_parse_share_defaults_to_none_when_omitted(agent_dir: Path) -> None:
     """
     Without a top-level ``agent_session_sharing:`` key the parsed

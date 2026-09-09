@@ -433,3 +433,101 @@ async def test_catalog_description_prefers_stored_row_over_spec(
     # Stored value present → it wins; the differing spec description
     # proves the route didn't blindly overwrite with the bundle's.
     assert entry["description"] == "Curated catalog label."
+
+
+async def test_hidden_agent_omitted_from_default_listing(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents`` (no ``include_hidden``) omits an agent declaring
+    ``hidden: true`` in its spec.
+
+    This is the whole point of the flag: a specialist a coordinator
+    already dispatches to via ``spawn`` (e.g. a ``kiro-native``-backed
+    ``Work`` agent) should not additionally clutter the human-facing
+    new-session picker as an independently-selectable top-level agent.
+    A visible, non-hidden agent registered alongside it proves the
+    filter is selective, not a blanket drop.
+    """
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        name="hidden-specialist",
+        bundle=build_agent_bundle(name="hidden-specialist", hidden=True),
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        name="visible-agent",
+        bundle=build_agent_bundle(name="visible-agent"),
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    ids = {a["id"] for a in resp.json()["data"]}
+    assert "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1" not in ids
+    assert "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2" in ids
+
+
+async def test_hidden_agent_included_with_include_hidden_true(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents?include_hidden=true`` includes agents declaring
+    ``hidden: true``, with the flag surfaced on the returned object.
+
+    The agent-facing ``sys_agent_list`` tool always sets this so a
+    coordinator (e.g. ``home``) can still resolve a hidden sub-agent's
+    id by name -- only the plain query the human-facing picker uses is
+    filtered.
+    """
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        name="hidden-specialist",
+        bundle=build_agent_bundle(name="hidden-specialist", hidden=True),
+    )
+
+    resp = await agents_client.get("/v1/agents?include_hidden=true")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3")
+    assert entry["hidden"] is True
+
+
+async def test_hidden_agent_still_resolvable_by_id_for_spawn(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agent_cache: AgentCache,
+) -> None:
+    """
+    A ``hidden: true`` agent stays fully resolvable by id -- ``hidden``
+    is purely a listing filter applied in this router, never consulted
+    by agent lookup/load. Session creation (``POST /v1/sessions
+    {agent_id}``) resolves a built-in via exactly this
+    ``agent_store.get`` + ``agent_cache.load`` pair, so proving both
+    succeed unchanged for a hidden agent is what guarantees ``spawn``
+    (and any direct ``agent_id`` launch) keeps working even though the
+    agent no longer appears in the default listing.
+    """
+    agent_id = "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id=agent_id,
+        name="hidden-specialist",
+        bundle=build_agent_bundle(name="hidden-specialist", hidden=True),
+    )
+
+    agent = agent_store.get(agent_id)
+    assert agent is not None
+    loaded = agent_cache.load(agent.id, agent.bundle_location, expand_env=True)
+    assert loaded.spec.hidden is True
