@@ -61,20 +61,61 @@ const DISPLAY_NAMES: Record<string, string> = {
 };
 
 function displayNameForAgent(name: string, harness?: string | null): string {
+  const harnessAgent = nativeCodingAgentForHarness(harness);
+  // Only stamp the vendor's generic label (e.g. "Kiro") onto the row that IS
+  // that harness's canonical builtin. A different builtin that merely
+  // executes through the same native harness (see dedupeNativeAgents below)
+  // keeps its own name, so two agents sharing a harness don't render as
+  // indistinguishable picker rows.
+  if (harnessAgent !== undefined && harnessAgent.agentName === name) {
+    return harnessAgent.displayName;
+  }
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
     nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
   );
 }
 
+// Non-canonical native-harness agent names known to be stale duplicates of
+// their harness's canonical builtin (e.g. a pre-rename typo the seeder used
+// to produce) rather than a deliberately distinct builtin that happens to
+// share the harness. Only names listed here fold into the canonical row when
+// they don't match it — or a fork/switch clone of it — directly; anything
+// else sharing a harness is treated as its own agent (e.g. a second
+// kiro-native-backed builtin) and kept as a separate picker row. Extend this
+// set, not the fold-in condition itself, when a future rename leaves another
+// orphaned row behind.
+const LEGACY_NATIVE_AGENT_NAMES = new Set(["kiro-naitive"]);
+
+/**
+ * Fold stale/non-canonical rows of a harness's canonical builtin into one
+ * entry, without swallowing a genuinely distinct builtin that happens to
+ * share the same native harness (e.g. a second kiro-native-backed agent).
+ *
+ * A row only folds into its harness's canonical bucket when it IS that
+ * canonical row, a fork/switch clone of it (`agentRootName` match), or a
+ * known legacy alias (`LEGACY_NATIVE_AGENT_NAMES`) — cases where it's
+ * provably the same underlying agent under an old or derived name. Every
+ * other row that resolves to a native harness keeps its own entry: the
+ * dedup's job is collapsing duplicates of ONE identity, not collapsing every
+ * row that merely shares a vendor's CLI plumbing.
+ */
 function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const result: AvailableAgent[] = [];
   const nativeIndex = new Map<string, number>();
   for (const agent of agents) {
     const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
     if (nativeAgent === undefined) {
+      result.push(agent);
+      continue;
+    }
+    const isCanonical = agent.name === nativeAgent.agentName;
+    const isCanonicalClone = agentRootName(agent.name) === nativeAgent.agentName;
+    const isLegacyAlias = LEGACY_NATIVE_AGENT_NAMES.has(agent.name);
+    if (!isCanonical && !isCanonicalClone && !isLegacyAlias) {
+      // A distinct builtin sharing this harness, not a stale duplicate of
+      // the canonical one — gets its own row.
       result.push(agent);
       continue;
     }
@@ -85,7 +126,7 @@ function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
       continue;
     }
     const existing = result[existingIndex];
-    if (agent.name === nativeAgent.agentName && existing.name !== nativeAgent.agentName) {
+    if (isCanonical && existing.name !== nativeAgent.agentName) {
       result[existingIndex] = agent;
     }
   }
