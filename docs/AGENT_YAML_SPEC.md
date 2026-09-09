@@ -50,6 +50,7 @@ of the agent YAML.
 | `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
 | `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
+| `hidden` | Optional | Omits this agent from the human-facing top-level agent listing (Web UI new-session picker / plain `GET /v1/agents`). Has no effect on launchability -- the agent stays resolvable by id and reachable via `spawn`. Defaults to `false`. |
 
 ## Executor
 

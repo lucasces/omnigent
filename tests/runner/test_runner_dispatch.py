@@ -7484,6 +7484,48 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_agent_list_requests_include_hidden_for_builtins(tmp_path: Path) -> None:
+    """
+    ``sys_agent_list`` always asks ``GET /v1/agents`` with
+    ``include_hidden=true``, never ``GET /v1/sessions``.
+
+    ``sys_agent_list`` is the agent-facing discovery tool (e.g. how a
+    coordinator like ``home`` resolves a hidden sub-agent's id by
+    name), not the Web UI's new-session picker -- so it must see the
+    unfiltered built-in catalog even though a plain ``GET /v1/agents``
+    (what the picker calls) hides ``hidden: true`` agents by default.
+    Asserting the param is absent on ``/v1/sessions`` proves this isn't
+    a blanket param added to every outgoing request.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    seen_params: dict[str, dict[str, str]] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        seen_params[request.url.path] = dict(request.url.params)
+        if request.url.path == "/v1/agents":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_agent_list",
+            arguments="{}",
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    assert seen_params["/v1/agents"]["include_hidden"] == "true"
+    assert "include_hidden" not in seen_params["/v1/sessions"]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_maps_agent_not_found() -> None:
     """
     A 404 from the create maps to ``agent_not_found`` so the LLM gets a

@@ -732,6 +732,7 @@ def build_agent_bundle(
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
+    hidden: bool | None = None,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
@@ -767,6 +768,8 @@ def build_agent_bundle(
         ``None`` omits it (the agent has no terminal access).
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
+    :param hidden: Optional top-level ``hidden:`` flag. ``None`` omits
+        the key (spec default ``False``).
     :returns: A gzipped tar archive containing the generated
         ``config.yaml`` plus optional sub-agent and skill files.
     """
@@ -790,6 +793,8 @@ def build_agent_bundle(
         config["guardrails"] = guardrails
     if terminals is not None:
         config["terminals"] = terminals
+    if hidden is not None:
+        config["hidden"] = hidden
     if executor is not None:
         config["executor"] = dict(executor)
         config["executor"].setdefault("config", {}).setdefault("harness", "claude-sdk")

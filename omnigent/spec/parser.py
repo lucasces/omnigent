@@ -278,6 +278,11 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # granting named users; ``public`` also allows ``__public__``
     # anonymous read.
     agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
+    # Top-level ``hidden:`` flag omits this agent from the
+    # human-facing top-level agent listing (Web UI new-session
+    # picker / plain ``GET /v1/agents``) without affecting whether
+    # it can be launched. See AgentSpec.hidden's docstring.
+    hidden = bool(raw.get("hidden", False))
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -315,6 +320,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         timers=timers,
         spawn=spawn,
         agent_session_sharing=agent_session_sharing,
+        hidden=hidden,
     )
 
 

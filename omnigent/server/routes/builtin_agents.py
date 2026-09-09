@@ -59,6 +59,9 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     # YAML agents don't persist it at registration today). Lets the
     # new-session picker show a hover description without a migration.
     description: str | None = agent.description
+    # Fails open (visible) if the bundle can't be loaded below — a
+    # broken bundle should stay discoverable/debuggable, not vanish.
+    hidden = False
     try:
         # Built-ins are operator-authored template agents
         # (session_id is None), so ${VAR} expansion against the server
@@ -91,6 +94,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        hidden = loaded.spec.hidden
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
@@ -115,6 +119,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # by a same-named ``omnigent run`` upload, but lets a newer
         # upload supersede the latter.
         builtin=agent.session_id is None and agent.id == builtin_agent_id(agent.name),
+        hidden=hidden,
     )
 
 
@@ -145,23 +150,40 @@ def create_builtin_agents_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        include_hidden: bool = Query(default=False),
     ) -> PaginatedList:
         """List built-in agents with cursor-based pagination.
 
         Returns only built-in agents — ``agent_store.list()`` filters
         ``session_id IS NULL`` — so session-scoped agents never appear.
 
+        Agents declaring ``hidden: true`` (specialists a coordinator
+        already reaches via ``spawn``, not meant to be picked directly
+        by a human) are dropped unless ``include_hidden=true`` — set by
+        the agent-facing ``sys_agent_list`` tool, never by the Web UI's
+        new-session picker, so a coordinator can still resolve a hidden
+        sub-agent's id by name while it stays off the human-facing list.
+        This filter is applied to the already-paginated page, so
+        ``has_more``/cursors describe the underlying (unfiltered) page,
+        not the visible count — acceptable for the small builtin counts
+        this endpoint serves today.
+
         :param request: The incoming FastAPI request (for auth).
         :param limit: Maximum number of agents to return (1-1000).
         :param after: Cursor — return agents after this id.
         :param before: Cursor — return agents before this id.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param include_hidden: When true, include agents declaring
+            ``hidden: true`` too. Defaults to false.
         :returns: A :class:`PaginatedList` of built-in agents.
         """
         _require_user(request, auth_provider)
         page = agent_store.list(limit=limit, after=after, before=before, order=order)
+        data = [_to_agent_object(a, agent_cache) for a in page.data]
+        if not include_hidden:
+            data = [a for a in data if not a.hidden]
         return PaginatedList(
-            data=[_to_agent_object(a, agent_cache) for a in page.data],
+            data=data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
