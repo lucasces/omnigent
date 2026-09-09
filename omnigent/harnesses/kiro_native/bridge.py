@@ -529,23 +529,27 @@ def _kiro_permission_modify_request_active(pane: str) -> bool:
 
 
 # Kiro V3 batches every pending subagent tool-call approval behind one
-# top-level picker ("N tool approvals pending from subagents", options
-# (a)/(f)/(c)/(x)) instead of showing each one modally like a non-subagent
-# prompt (see _kiro_permission_prompt_active, which never matches this
-# picker — none of its markers appear on it). "(c) Configure individually"
-# opens AGENT MONITOR, a per-subagent view where each pending prompt is
-# answered with its own "y approve · n deny · t trust" shortcuts instead of
-# the top-level Down/Enter picker navigation.
+# top-level picker (an "Orchestrating (N agents)" summary with an
+# "N tool approval(s) pending" line and (a)/(f)/(c)/(x) options) instead of
+# showing each one modally like a non-subagent prompt (see
+# _kiro_permission_prompt_active, which never matches this picker — none of
+# its markers appear on it). "(c) Configure individually" opens AGENT
+# MONITOR, a per-subagent view where each pending prompt is answered with
+# its own "y approve · n deny · t trust" shortcuts instead of the top-level
+# Down/Enter picker navigation.
 #
-# The marker must be count-agnostic: Kiro pluralizes the header by the
-# pending count, so a batch of exactly ONE renders "1 tool approval pending
-# from subagents" (singular) while 2+ render "N tool approvals pending from
-# subagents" (plural). Matching the plural "approvals" missed the singular
-# case entirely, so a lone pending subagent approval was never detected and
-# _focus_kiro_subagent_prompt raised "subagent approval prompt was not
-# visible", wedging the session on every single-pending batch. The suffix
-# below is present verbatim in both forms and unique to this picker.
-_KIRO_SUBAGENT_BATCH_MARKER = "pending from subagents"
+# The marker must not depend on Kiro's pending-count wording: a live batch
+# of exactly ONE was observed rendering plain "1 tool approval pending" with
+# no "from subagents" suffix, unlike the plural form this used to match on.
+# Matching text from that count line therefore missed every single-pending
+# batch, so _focus_kiro_subagent_prompt's initial wait never saw the picker,
+# timed out, and raised "subagent approval prompt was not visible" without
+# ever sending the "c" keystroke that would have drilled in — a verdict the
+# human had already given then sat undelivered, with the underlying tool
+# call stuck waiting forever. The option label below is present verbatim
+# regardless of pending count and unique to this picker (AGENT MONITOR's
+# own footer reads "y approve · n deny · t trust" instead).
+_KIRO_SUBAGENT_BATCH_MARKER = "Configure individually (agent monitor)"
 _KIRO_AGENT_MONITOR_MARKER = "AGENT MONITOR"
 _KIRO_SUBAGENT_OUTPUT_HEADER_PREFIX = "SUBAGENT OUTPUT ["
 # Matches an AGENT MONITOR subagent row, e.g. "  1 ⚠ sleep1 Shell" or

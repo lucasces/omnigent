@@ -85,6 +85,23 @@ _SUBAGENT_BATCH_PANE = """
    (c) Configure individually (agent monitor)
    (x) Exit (cancel subagents)
 """
+# Captured live from a real kiro-native crew run: a lone pending approval
+# renders "1 tool approval pending" with no "from subagents" suffix, unlike
+# the plural fixture above — the mismatch that let an already-approved
+# subagent tool call sit forever unconfirmed (see
+# _kiro_subagent_batch_prompt_active's docstring in kiro_native_bridge.py).
+_SUBAGENT_BATCH_PANE_SINGLE_PENDING = """
+────────────────────────────────────────────────────────────────────────────
+● Orchestrating (2 agents)
+  ● sleep1 kiro_default Shell ⚠ tool approval needed
+  ● sleep2 kiro_default Completed
+────────────────────────────────────────────────────────────────────────────
+ ⚠ 1 tool approval pending
+ ❯ (a) Approve all pending
+   (f) Approve all pending and auto-approve future subagent requests
+   (c) Configure individually (agent monitor)
+   (x) Exit (cancel subagents)
+"""
 
 
 def _agent_monitor_pane(*, focused: str, rows: dict[str, str]) -> str:
@@ -581,6 +598,13 @@ def test_kiro_subagent_batch_prompt_active_detects_only_the_batched_picker() -> 
     assert not bridge._kiro_subagent_batch_prompt_active(_PERMISSION_PANE)
 
 
+def test_kiro_subagent_batch_prompt_active_detects_singular_pending_without_subagents_suffix() -> (
+    None
+):
+    """A lone pending approval drops the "from subagents" suffix the marker used to require."""
+    assert bridge._kiro_subagent_batch_prompt_active(_SUBAGENT_BATCH_PANE_SINGLE_PENDING)
+
+
 def test_kiro_agent_monitor_active_detects_only_the_monitor_view() -> None:
     assert bridge._kiro_agent_monitor_active(_AGENT_MONITOR_SLEEP1_FOCUSED)
     assert not bridge._kiro_agent_monitor_active(_SUBAGENT_BATCH_PANE)
@@ -614,6 +638,36 @@ def test_send_kiro_subagent_permission_verdict_accepts_already_focused_subagent(
         monkeypatch,
         pane_outputs=[
             _SUBAGENT_BATCH_PANE,
+            _AGENT_MONITOR_SLEEP1_FOCUSED,
+            _AGENT_MONITOR_SLEEP1_RESOLVED,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_subagent_permission_verdict(
+        bridge_dir, subagent_name="sleep1", action="accept", timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["c", "y"]
+
+
+def test_send_kiro_subagent_permission_verdict_accepts_singular_pending_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a lone pending approval renders without the "from subagents"
+    suffix the batch-picker marker required, previously timing out
+    _focus_kiro_subagent_prompt before it ever sent "c" and leaving an
+    already-approved tool call stuck waiting forever."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _SUBAGENT_BATCH_PANE_SINGLE_PENDING,
             _AGENT_MONITOR_SLEEP1_FOCUSED,
             _AGENT_MONITOR_SLEEP1_RESOLVED,
         ],
