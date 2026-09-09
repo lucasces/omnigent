@@ -519,6 +519,82 @@ describe("useAvailableAgents", () => {
     ]);
   });
 
+  it("keeps two distinct builtins on the same native harness as separate picker rows", async () => {
+    // "Work" is a second builtin agent whose executor also runs the
+    // kiro-native harness (same underlying CLI/PTY plumbing as the seeded
+    // kiro-native-ui wrapper), but it is its own agent — different id,
+    // different name, no relation to a rename/fork of kiro-native-ui. It
+    // must survive dedupeNativeAgents as its own row instead of being
+    // folded into (or dropped in favor of) the canonical kiro row.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native" },
+          { id: "ag_work", name: "Work", harness: "kiro-native" },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_kiro",
+        name: "kiro-native-ui",
+        display_name: "Kiro",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+      },
+      {
+        id: "ag_work",
+        name: "Work",
+        // Not "Kiro": the generic vendor label is reserved for the row that
+        // IS the harness's canonical builtin (see displayNameForAgent).
+        display_name: "Work",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+      },
+    ]);
+  });
+
+  it("still collapses a known legacy-alias native row into its canonical builtin even without a fork suffix", async () => {
+    // Regression guard for the original dedup intent: a bare rename artifact
+    // (no "(fork ...)" suffix to root-match against) must keep folding into
+    // the canonical row, distinguishing it from a genuinely distinct builtin
+    // like "Work" above.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_stale_kiro", name: "kiro-naitive", harness: "kiro-native" },
+          { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native" },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_kiro",
+        name: "kiro-native-ui",
+        display_name: "Kiro",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+      },
+    ]);
+  });
+
   it("collapses same-named custom agents with distinct agent_ids to the newest session's row", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
