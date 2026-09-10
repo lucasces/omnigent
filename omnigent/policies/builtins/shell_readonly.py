@@ -40,6 +40,10 @@ policies are attached, ``ask_on_os_tools``'s unconditional ASK on the shell
 tool always wins over this policy's ALLOW. Use this policy *instead of*
 ``ask_on_os_tools`` for the shell tool surface.
 
+**Audit trail**: every evaluated command (and, when it runs, its outcome) is
+appended to a local JSONL log for after-the-fact PDCA review — see
+:mod:`omnigent.policies.builtins.shell_audit` for the log format and location.
+
 YAML usage::
 
     policies:
@@ -55,6 +59,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
+import logging
 import re
 import shlex
 from collections.abc import Callable
@@ -78,7 +84,14 @@ from omnigent.policies.builtins._shell import (
     split_command_segments,
     unwrap_shell_command,
 )
+from omnigent.policies.builtins.shell_audit import (
+    build_shell_audit_event,
+    record_shell_audit_event,
+    truncate_for_audit,
+)
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
+
+_logger = logging.getLogger(__name__)
 
 _PRESET_DATA_PACKAGE = "omnigent.policies.builtins"
 _PRESET_DATA_DIR = "data"
@@ -538,6 +551,115 @@ def _matches_pattern(tokens: list[str], pattern: tuple[str, ...]) -> bool:
     )
 
 
+# ── Audit-trail helpers ─────────────────────────────────────────────────
+#
+# Small, dependency-free helpers used by the ``_audit_decision`` /
+# ``_audit_execution`` closures inside :func:`allow_read_only_shell`. Kept
+# as free functions (rather than nested) since none of them close over the
+# factory's ``patterns`` / ``shell_tool_names`` state.
+
+
+def _audit_session_id() -> str | None:
+    """Best-effort session id for an audit record.
+
+    :class:`~omnigent.policies.schema.PolicyEvent` carries no
+    conversation/session id (see
+    :class:`~omnigent.policies.schema.EventContext`), so this reads it out of
+    band: the server's request-scoped ContextVar
+    (:func:`omnigent.debug_logging.current_session_id`, bound per request by
+    the HTTP middleware) first, then the runner's process-wide primary
+    session (:func:`omnigent.debug_logging.runner_primary_session_id`,
+    set once at spawn — mis-attributes a sub-agent turn to its parent, the
+    same known limitation the debug-log sink documents).
+
+    :returns: A session id, or ``None`` when neither source applies.
+    """
+    from omnigent.debug_logging import current_session_id, runner_primary_session_id
+
+    return current_session_id() or runner_primary_session_id()
+
+
+def _audit_user_id(event: PolicyEvent) -> str | None:
+    """Best-effort identity of the session owner for an audit record.
+
+    Prefers the process-local authenticated user
+    (:func:`omnigent.debug_logging.current_user_id`, set on the runner and
+    the multi-tenant server), falling back to the event's
+    ``context.actor.run_as`` (populated server-side per request).
+
+    :param event: The policy event carrying ``context.actor``.
+    :returns: A user identifier (typically an email), or ``None`` when
+        neither source is available.
+    """
+    from omnigent.debug_logging import current_user_id
+
+    user_id = current_user_id()
+    if user_id:
+        return user_id
+    context = event.get("context")
+    actor = context.get("actor") if isinstance(context, dict) else None
+    run_as = actor.get("run_as") if isinstance(actor, dict) else None
+    return run_as or None
+
+
+def _request_data_command(request_data: object) -> str | None:
+    """Pull the original shell command out of a ``tool_result``'s ``request_data``.
+
+    :param request_data: ``event["request_data"]`` — the originating
+        ``{"name", "arguments"}`` tool-call payload the server threads onto
+        the ``tool_result`` event (absent on the runner-side gate; see
+        ``_audit_execution``'s docstring).
+    :returns: The command string, or ``None`` when unavailable.
+    """
+    if not isinstance(request_data, dict):
+        return None
+    arguments = request_data.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    command = arguments.get("command")
+    return command if isinstance(command, str) and command.strip() else None
+
+
+def _parse_tool_result_data(data: object) -> tuple[int | None, str | None, str | None]:
+    """Best-effort ``(exit_code, stdout_preview, stderr_preview)`` from a tool_result payload.
+
+    ``data`` is either the tool's raw output string (runner-side gate) or
+    ``{"result": <output>}`` (server-side engine — see
+    ``omnigent.server.routes._sessions.orchestration``'s TOOL_RESULT
+    dispatch). ``<output>`` is the shell tool's text output — for
+    ``sys_os_shell`` a JSON-encoded ``{"stdout", "stderr", "exit_code", ...}``
+    blob; native shell tools (``Bash``, ``Shell``, ...) return plain text with
+    no structured exit code. A non-JSON output still yields a stdout preview
+    of the raw text, so the audit trail shows *that* the command ran even
+    without a breakdown.
+
+    :param data: ``event["data"]`` at the ``tool_result`` phase.
+    :returns: ``(exit_code, stdout_preview, stderr_preview)``, each ``None``
+        when not recoverable.
+    """
+    output = data.get("result") if isinstance(data, dict) else data
+    if isinstance(output, str):
+        try:
+            parsed = json.loads(output)
+        except (json.JSONDecodeError, ValueError):
+            return None, truncate_for_audit(output), None
+    elif isinstance(output, dict):
+        parsed = output
+    else:
+        return None, None, None
+    if not isinstance(parsed, dict):
+        return None, None, None
+    exit_code = parsed.get("exit_code")
+    exit_code = exit_code if isinstance(exit_code, int) else None
+    stdout = parsed.get("stdout")
+    stderr = parsed.get("stderr")
+    return (
+        exit_code,
+        truncate_for_audit(stdout) if isinstance(stdout, str) else None,
+        truncate_for_audit(stderr) if isinstance(stderr, str) else None,
+    )
+
+
 def allow_read_only_shell(
     presets: list[str] | None = None,
     extra_allow: list[list[str]] | None = None,
@@ -627,30 +749,113 @@ def allow_read_only_shell(
                 }
         return {"result": "ALLOW"}
 
+    def _audit_decision(
+        command: str,
+        tool: str,
+        response: PolicyResponse,
+        event: PolicyEvent,
+    ) -> None:
+        """Append a ``"decision"`` audit row for one evaluated command.
+
+        Never raises — a broken audit sink must not turn into a denied
+        shell command (see :mod:`shell_audit`'s module docstring).
+
+        :param command: The full command string that was evaluated.
+        :param tool: The shell tool name the command was submitted through.
+        :param response: This policy's own verdict for *command*.
+        :param event: The originating ``tool_call`` event, for identity.
+        """
+        try:
+            decision = "auto_approved" if response.get("result") == "ALLOW" else "blocked"
+            record_shell_audit_event(
+                build_shell_audit_event(
+                    stage="decision",
+                    decision=decision,
+                    tool=tool,
+                    command=truncate_for_audit(command),
+                    reason=response.get("reason"),
+                    session_id=_audit_session_id(),
+                    user_id=_audit_user_id(event),
+                )
+            )
+        except Exception:  # noqa: BLE001 — audit failures must never deny a command
+            _logger.warning("shell command decision audit failed", exc_info=True)
+
+    def _audit_execution(event: PolicyEvent) -> None:
+        """Append an ``"execution"`` audit row when a shell tool_result lands.
+
+        Only fires when the original command is recoverable from
+        ``event["request_data"]`` — present on the server-side engine's
+        TOOL_RESULT dispatch, absent on the runner-side gate (see
+        :class:`omnigent.runner.policy.RunnerToolPolicyGate`), which is a
+        known coverage gap for locally-run sessions. Silently no-ops when
+        the command can't be recovered rather than logging a row with no
+        useful correlation.
+
+        :param event: The ``tool_result`` policy event.
+        """
+        try:
+            command = _request_data_command(event.get("request_data"))
+            if command is None:
+                return
+            verdict = _evaluate_command(command)
+            decision = "auto_approved" if verdict.get("result") == "ALLOW" else "manually_approved"
+            exit_code, stdout_preview, stderr_preview = _parse_tool_result_data(event.get("data"))
+            record_shell_audit_event(
+                build_shell_audit_event(
+                    stage="execution",
+                    decision=decision,
+                    tool=event.get("target") or "",
+                    command=truncate_for_audit(command),
+                    session_id=_audit_session_id(),
+                    user_id=_audit_user_id(event),
+                    exit_code=exit_code,
+                    stdout_preview=stdout_preview,
+                    stderr_preview=stderr_preview,
+                )
+            )
+        except Exception:  # noqa: BLE001 — audit failures must never deny a command
+            _logger.warning("shell command execution audit failed", exc_info=True)
+
     def _evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """
         Evaluate one policy event against the read-only shell allowlist.
 
-        Acts on ``tool_call`` events for the configured shell tools only;
+        Decides on ``tool_call`` events for the configured shell tools only;
         abstains on everything else so the policy composes with others
-        (e.g. a separate approval gate for Read/Write/Edit tools).
+        (e.g. a separate approval gate for Read/Write/Edit tools). Every
+        evaluated ``tool_call`` and every observed shell ``tool_result`` is
+        also appended to the local audit log (:mod:`shell_audit`) so the
+        allowlist can be reviewed after the fact — see that module's
+        docstring for the PDCA use case. Auditing is a side effect only:
+        ``tool_result`` handling always returns ``None`` (abstain), never
+        gating or transforming the result.
 
         :param event: The policy event.
         :returns: A :class:`PolicyResponse`, or ``None`` to abstain.
         """
-        if event.get("type") != "tool_call":
+        event_type = event.get("type")
+        if event_type == "tool_result":
+            tool = event.get("target")
+            if isinstance(tool, str) and tool in shell_tool_names:
+                _audit_execution(event)
+            return None
+        if event_type != "tool_call":
             return None
         data = event.get("data")
         if not isinstance(data, dict):
             return None
-        if data.get("name") not in shell_tool_names:
+        tool = data.get("name")
+        if not isinstance(tool, str) or tool not in shell_tool_names:
             return None
         args = data.get("arguments")
         args = args if isinstance(args, dict) else {}
         command = args.get("command")
         if not isinstance(command, str) or not command.strip():
             return None
-        return _evaluate_command(command)
+        response = _evaluate_command(command)
+        _audit_decision(command, tool, response, event)
+        return response
 
     return _evaluate
 
