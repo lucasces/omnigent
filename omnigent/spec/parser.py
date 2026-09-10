@@ -686,6 +686,9 @@ def _parse_executor(
         raw_dict = {str(k): str(v) for k, v in connection_raw.items()}
         connection = expand_env_vars(raw_dict) if expand_env else raw_dict
     auth = _parse_executor_auth(raw, expand_env=expand_env)
+    # Opt-in, kiro-native-only agent-profile launch. See
+    # ExecutorSpec.kiro_agent_profile's docstring.
+    kiro_agent_profile = bool(raw.get("kiro_agent_profile", False))
     return ExecutorSpec(
         type=etype,
         timeout=_parse_int_field(raw.get("timeout", 3600), "executor.timeout"),
@@ -700,6 +703,7 @@ def _parse_executor(
         connection=connection,
         context_window=context_window,
         auth=auth,
+        kiro_agent_profile=kiro_agent_profile,
     )
 
 

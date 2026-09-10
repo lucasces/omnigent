@@ -236,6 +236,115 @@ def write_kiro_workspace_mcp_config(
     return path
 
 
+# kiro-cli agent profiles live at ``<workspace>/.kiro/agents/<name>.json``
+# and are selected at launch with ``--agent <name>``. Unlike
+# write_kiro_workspace_mcp_config's single shared ``.kiro/settings/mcp.json``
+# (merged by the FIXED server name "omnigent" -- a pre-existing collision
+# when multiple sessions share one workspace, since the last writer's
+# bridge_dir wins for every session's Omnigent MCP entry; not addressed
+# here), each session's agent profile gets its OWN file, named from a
+# digest of the session id, so concurrent sessions in the same workspace
+# (e.g. a coordinator and its specialists) can never collide on it.
+_WORKSPACE_AGENTS_DIR_REL = Path(".kiro") / "agents"
+_AGENT_PROFILE_PREFIX = "omnigent-"
+# Orphaned agent-profile files older than this are swept at the next
+# kiro-native launch in the same workspace. Mitigates a runner dying
+# (SIGKILL / host crash) before cleanup_kiro_agent_profile ever runs on
+# session teardown: kiro-native is not one of the harnesses wired into
+# native_bridge_common's owner-pid orphan reaper (that only covers the
+# runner-private /tmp bridge dirs of claude/codex/antigravity/opencode/pi),
+# and this file lives in the user's actual workspace checkout, so nothing
+# else will ever clean it up. A generous TTL keeps this a pure best-effort
+# backstop -- never a race with a live session's own file.
+_AGENT_PROFILE_ORPHAN_TTL_S = 24 * 60 * 60
+
+
+def kiro_agent_profile_name(session_id: str) -> str:
+    """Return the unique-per-session kiro-cli agent profile name.
+
+    Deterministic from *session_id* alone (mirrors
+    ``bridge_dir_for_session_id``) so cleanup never needs to remember or
+    re-derive the name from anything else.
+    """
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:20]
+    return f"{_AGENT_PROFILE_PREFIX}{digest}"
+
+
+def kiro_agent_profile_path(workspace: Path, session_id: str) -> Path:
+    """Return the path of the per-session kiro-cli agent profile."""
+    return workspace / _WORKSPACE_AGENTS_DIR_REL / f"{kiro_agent_profile_name(session_id)}.json"
+
+
+def sweep_orphaned_kiro_agent_profiles(workspace: Path) -> int:
+    """Best-effort removal of stale omnigent-written agent profiles.
+
+    Only touches files matching ``_AGENT_PROFILE_PREFIX`` and older than
+    ``_AGENT_PROFILE_ORPHAN_TTL_S``; a user's own hand-authored profiles
+    under ``.kiro/agents/`` are never touched. See the module-level
+    ``_AGENT_PROFILE_ORPHAN_TTL_S`` comment for why this backstop exists.
+    Called opportunistically from ``write_kiro_agent_profile`` (i.e. at
+    the next kiro-native launch in this workspace), not on a timer.
+
+    :param workspace: The kiro-cli workspace root.
+    :returns: The number of stale profile files removed.
+    """
+    agents_dir = workspace / _WORKSPACE_AGENTS_DIR_REL
+    if not agents_dir.is_dir():
+        return 0
+    cutoff = time.time() - _AGENT_PROFILE_ORPHAN_TTL_S
+    removed = 0
+    for entry in agents_dir.glob(f"{_AGENT_PROFILE_PREFIX}*.json"):
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            entry.unlink()
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
+
+def write_kiro_agent_profile(workspace: Path, session_id: str, *, prompt: str) -> Path:
+    """Write the per-session kiro-cli agent profile declaring *prompt*.
+
+    kiro-cli's ``--agent <name>`` flag selects a named profile from
+    ``<workspace>/.kiro/agents/<name>.json``. Schema is
+    ``{"prompt": <system prompt>, "resources": [...]}``; resources are
+    left empty for now. Written atomically (tmp + os.replace), mirroring
+    ``write_kiro_workspace_mcp_config``. Sweeps orphaned profiles from
+    prior crashed sessions in this workspace first (best-effort; see
+    ``sweep_orphaned_kiro_agent_profiles``).
+
+    :param workspace: The kiro-cli workspace root.
+    :param session_id: Session/conversation id; keys the unique filename.
+    :param prompt: The agent's system prompt (``AgentSpec.instructions``).
+    :returns: The written profile's path. The profile *name* to pass to
+        ``--agent`` is ``kiro_agent_profile_name(session_id)``.
+    """
+    sweep_orphaned_kiro_agent_profiles(workspace)
+    path = kiro_agent_profile_path(workspace, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: _JsonObject = {"prompt": prompt, "resources": []}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def cleanup_kiro_agent_profile(path: Path) -> None:
+    """Remove a per-session kiro-cli agent profile written by this session.
+
+    Idempotent / best-effort, mirroring ``_delete_native_bridge_dirs``'s
+    ignore-missing contract: called from session teardown
+    (``DELETE /v1/sessions/{id}`` and ``.../resources``). Does NOT cover an
+    abrupt runner kill (SIGKILL / host crash) that never reaches teardown
+    -- ``sweep_orphaned_kiro_agent_profiles`` is the backstop for that
+    case, run at the next kiro-native launch in the same workspace.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+
+
 def build_kiro_native_spawn_env(session_id: str) -> dict[str, str]:
     """Build the ``HARNESS_KIRO_NATIVE_*`` env for the harness executor."""
     bridge_dir = prepare_bridge_dir(session_id)

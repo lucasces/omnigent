@@ -217,6 +217,36 @@ def test_build_kiro_launch_appends_model_then_prompt() -> None:
     ]
 
 
+def test_build_kiro_launch_injects_agent_flag() -> None:
+    """``agent=`` injects ``--agent <name>`` ahead of passthrough args."""
+    launch = build_kiro_launch(
+        ["--foo"],
+        agent="omnigent-deadbeef",
+        env={},
+        which=lambda _cmd: "/usr/bin/kiro-cli",
+    )
+
+    assert launch.argv == [
+        "/usr/bin/kiro-cli",
+        "chat",
+        "--tui",
+        "--agent",
+        "omnigent-deadbeef",
+        "--foo",
+    ]
+
+
+def test_build_kiro_launch_omits_agent_flag_by_default() -> None:
+    """No ``agent=`` means no ``--agent`` flag — kiro-cli's default agent runs."""
+    launch = build_kiro_launch(
+        ["--foo"],
+        env={},
+        which=lambda _cmd: "/usr/bin/kiro-cli",
+    )
+
+    assert "--agent" not in launch.argv
+
+
 def test_launched_kiro_terminal_rejects_non_object_payload() -> None:
     """A non-dict runner payload is reported as malformed."""
     with pytest.raises(ClickException, match="non-object JSON"):

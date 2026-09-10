@@ -114,6 +114,7 @@ from omnigent.runner.native import (
     _claude_native_bridge_id_with_optional_labels,
     _claude_native_session_wants_rebuild,
     _claude_native_terminal_arrives_via_transfer,
+    _cleanup_kiro_agent_profile,
     _codex_ensure_response_with_policy_notice,
     _codex_native_model_from_spec,
     _codex_native_terminal_arrives_via_transfer,
@@ -4110,7 +4111,12 @@ def create_runner_app(
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
-            elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
+            elif harness_name in (
+                "cursor-native",
+                "opencode-native",
+                "kimi-native",
+                "kiro-native",
+            ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
                 )
@@ -4447,6 +4453,7 @@ def create_runner_app(
             server_client=server_client,
             session_id=session_id,
         )
+        await _cleanup_kiro_agent_profile(session_id)
 
         # The SDK harnesses' router is started here (not by a terminal launch
         # path), so this is its only teardown: without it the session leaks an
@@ -11079,6 +11086,7 @@ def create_runner_app(
             server_client=server_client,
             session_id=session_id,
         )
+        await _cleanup_kiro_agent_profile(session_id)
         return JSONResponse(
             status_code=200,
             content={

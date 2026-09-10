@@ -53,6 +53,7 @@ from omnigent.runner.app import (
     _auto_create_cursor_terminal,
     _auto_create_kiro_terminal,
     _auto_create_pi_terminal,
+    _cleanup_kiro_agent_profile,
     _KiroNativeLaunchConfig,
     _load_claude_launch_metadata,
     _log_terminal_lookup_miss,
@@ -457,6 +458,218 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
     assert workspace_mcp.exists()
     mcp_servers = json.loads(workspace_mcp.read_text())["mcpServers"]
     assert "serve-mcp" in mcp_servers["omnigent"]["args"]
+
+
+def _patch_kiro_auto_create_deps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    """Shared plumbing for the kiro-native agent-profile auto-create tests.
+
+    Trims
+    ``test_auto_create_kiro_terminal_launches_required_terminal_with_isolated_env``'s
+    setup to what these tests need: a fake kiro-cli resolver, no-op
+    forwarder/permission-mirror stand-ins, a fake launch config pinned at
+    *tmp_path*, and a resource registry that records the launched
+    ``TerminalEnvSpec`` into the returned dict under "spec".
+    """
+    import omnigent.harnesses.kiro_native.main as kiro_native
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    monkeypatch.setattr(
+        kiro_native, "resolve_kiro_executable", lambda **_kwargs: "/usr/bin/kiro-cli"
+    )
+
+    async def _noop(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.kiro_native.session_forwarder.supervise_kiro_session_forwarder",
+        _noop,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.kiro_native.permissions.supervise_kiro_permission_mirror",
+        _noop,
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
+        return _KiroNativeLaunchConfig(
+            workspace=tmp_path,
+            terminal_launch_args=[],
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launch; exposes ONLY the required-terminal launch API."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del parent_os_env
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_kiro_main",
+                type="terminal",
+                session_id=session_id,
+                name="kiro:main",
+                metadata={"terminal_name": "kiro", "session_key": "main", "running": True},
+            )
+
+    captured["registry"] = _FakeResourceRegistry()
+    return captured
+
+
+async def _noop_ensure_relay(_session_id: str, **_kwargs: Any) -> None:
+    """Stand-in ``ensure_comment_relay`` that does nothing."""
+    return
+
+
+@pytest.mark.asyncio
+async def test_auto_create_kiro_terminal_agent_profile_opt_in_writes_profile_and_agent_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``executor.kiro_agent_profile: true`` writes a per-session kiro-cli
+    agent profile and launches kiro-cli with ``--agent <unique name>``.
+
+    Also verifies the paired teardown hook (``_cleanup_kiro_agent_profile``,
+    called from the same ``DELETE /v1/sessions`` / ``.../resources`` hooks
+    as ``_delete_native_bridge_dirs``) removes exactly that file and is
+    idempotent on a second call.
+    """
+    session_id = "conv_agent_profile_opt_in"
+    ctx = _patch_kiro_auto_create_deps(tmp_path, monkeypatch)
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="Work",
+        instructions="You are Work, a coordinator.",
+        executor=ExecutorSpec(kiro_agent_profile=True),
+    )
+
+    await _auto_create_kiro_terminal(
+        session_id,
+        ctx["registry"],
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        ensure_comment_relay=_noop_ensure_relay,
+        agent_spec=agent_spec,
+    )
+
+    expected_name = kiro_native_bridge.kiro_agent_profile_name(session_id)
+    profile_path = tmp_path / ".kiro" / "agents" / f"{expected_name}.json"
+    assert profile_path.exists()
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert payload == {"prompt": "You are Work, a coordinator.", "resources": []}
+
+    spec = ctx["spec"]
+    assert "--agent" in spec.args
+    assert spec.args[spec.args.index("--agent") + 1] == expected_name
+
+    await _cleanup_kiro_agent_profile(session_id)
+    assert not profile_path.exists()
+    # Idempotent: a second teardown call (e.g. DELETE retried) is a no-op.
+    await _cleanup_kiro_agent_profile(session_id)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_kiro_terminal_without_opt_in_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    kiro-native-ui's default (``kiro_agent_profile`` unset -> ``False``)
+    stays completely untouched: no profile file, no ``--agent`` flag, and
+    teardown has nothing registered to remove.
+    """
+    session_id = "conv_no_opt_in"
+    ctx = _patch_kiro_auto_create_deps(tmp_path, monkeypatch)
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="kiro-native-ui",
+        instructions="Kiro is running in the session terminal.",
+        executor=ExecutorSpec(config={"harness": "kiro-native"}),
+    )
+
+    await _auto_create_kiro_terminal(
+        session_id,
+        ctx["registry"],
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        ensure_comment_relay=_noop_ensure_relay,
+        agent_spec=agent_spec,
+    )
+
+    assert not (tmp_path / ".kiro" / "agents").exists()
+    assert "--agent" not in ctx["spec"].args
+
+    # Nothing was registered for this session, so teardown is a clean no-op.
+    await _cleanup_kiro_agent_profile(session_id)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_kiro_terminal_without_agent_spec_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``agent_spec`` at all (the pre-wiring default) is also a no-op."""
+    session_id = "conv_no_agent_spec"
+    ctx = _patch_kiro_auto_create_deps(tmp_path, monkeypatch)
+
+    await _auto_create_kiro_terminal(
+        session_id,
+        ctx["registry"],
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        ensure_comment_relay=_noop_ensure_relay,
+    )
+
+    assert not (tmp_path / ".kiro" / "agents").exists()
+    assert "--agent" not in ctx["spec"].args
+
+
+@pytest.mark.asyncio
+async def test_auto_create_kiro_terminal_agent_profile_opt_in_empty_instructions_is_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opt-in with no (or blank) ``instructions`` writes nothing either."""
+    session_id = "conv_opt_in_empty_instructions"
+    ctx = _patch_kiro_auto_create_deps(tmp_path, monkeypatch)
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="empty-prompt-agent",
+        instructions="   ",
+        executor=ExecutorSpec(kiro_agent_profile=True),
+    )
+
+    await _auto_create_kiro_terminal(
+        session_id,
+        ctx["registry"],
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        ensure_comment_relay=_noop_ensure_relay,
+        agent_spec=agent_spec,
+    )
+
+    assert not (tmp_path / ".kiro" / "agents").exists()
+    assert "--agent" not in ctx["spec"].args
 
 
 @pytest.mark.asyncio

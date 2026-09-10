@@ -163,6 +163,14 @@ _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
 # Bound how long terminal (re)creation waits for a cancelled forwarder.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 
+# Per-session kiro-cli agent-profile file path awaiting cleanup on session
+# teardown (see _auto_create_kiro_terminal / _cleanup_kiro_agent_profile).
+# Mirrors _AUTO_FORWARDER_TASKS's per-session ephemeral-state registry
+# pattern: populated at write time, popped at teardown, so cleanup never
+# needs to re-derive the workspace path (which requires a server round
+# trip) from just a session id.
+_KIRO_AGENT_PROFILE_FILES: dict[str, Path] = {}
+
 # Delegated runner bearers last 30 minutes and refresh five minutes before
 # expiry. A one-minute cadence allows several retries without giving the child
 # the runner binding token; cached factory calls stay local and cheap.
@@ -3145,12 +3153,22 @@ async def _auto_create_kiro_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
-    """Auto-create the Kiro TUI terminal for a kiro-native session."""
+    """Auto-create the Kiro TUI terminal for a kiro-native session.
+
+    :param agent_spec: Optional resolved agent spec for the session. When it
+        opts in via ``executor.kiro_agent_profile`` and declares non-empty
+        ``instructions``, a per-session kiro-cli agent profile is written
+        and kiro-cli is launched with ``--agent <name>`` against it. See
+        ``ExecutorSpec.kiro_agent_profile``.
+    """
     from omnigent.harnesses.kiro_native.bridge import (
         KIRO_NATIVE_ENV_UNSET,
         build_kiro_native_terminal_env,
+        kiro_agent_profile_name,
         prepare_bridge_dir,
+        write_kiro_agent_profile,
         write_kiro_workspace_mcp_config,
     )
     from omnigent.harnesses.kiro_native.main import build_kiro_launch
@@ -3171,10 +3189,25 @@ async def _auto_create_kiro_terminal(
     # launch with no relay to route calls back to. Mirrors cursor-native.
     if server_client is not None and ensure_comment_relay is not None:
         write_kiro_workspace_mcp_config(workspace_path, bridge_dir)
+    # Opt-in per-session kiro-cli agent profile (ExecutorSpec.kiro_agent_profile).
+    # kiro-native-ui and every other kiro-native session that doesn't set the
+    # flag never reaches this branch, so nothing is written or later cleaned up
+    # for them.
+    kiro_agent_name: str | None = None
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is not None and spec.executor.kiro_agent_profile:
+        agent_prompt = (spec.instructions or "").strip()
+        if agent_prompt:
+            profile_path = write_kiro_agent_profile(
+                workspace_path, session_id, prompt=agent_prompt
+            )
+            _KIRO_AGENT_PROFILE_FILES[session_id] = profile_path
+            kiro_agent_name = kiro_agent_profile_name(session_id)
     kiro_launch = build_kiro_launch(
         launch_config.terminal_launch_args or [],
         resume_id=launch_config.external_session_id,
         model=launch_config.model_override,
+        agent=kiro_agent_name,
     )
     launch_epoch_ms = int(time.time() * 1000)
     terminal_view = await resource_registry.launch_required_terminal(
@@ -3266,6 +3299,34 @@ async def _auto_create_kiro_terminal(
         _forwarder_task.get_name(),
     )
     return terminal_view
+
+
+async def _cleanup_kiro_agent_profile(session_id: str) -> None:
+    """Remove *session_id*'s kiro-cli agent-profile file, if one was written.
+
+    Called from the same session-teardown hooks as ``_delete_native_bridge_dirs``
+    (``DELETE /v1/sessions/{id}`` and ``.../resources``) so the opt-in
+    ``.kiro/agents/<name>.json`` file (see ``ExecutorSpec.kiro_agent_profile``)
+    never lingers in the user's workspace after a normal session end or an
+    error that reaches teardown. No-op when this session never wrote one
+    (the opt-in was off, its ``instructions`` were empty, or the terminal was
+    never launched) -- pops ``_KIRO_AGENT_PROFILE_FILES`` so a second call is
+    a harmless no-op too.
+
+    Does NOT cover an abrupt runner kill (SIGKILL / host crash) that never
+    reaches a teardown endpoint: `_KIRO_AGENT_PROFILE_FILES` is in-memory and
+    dies with the process. ``sweep_orphaned_kiro_agent_profiles`` is the
+    best-effort backstop for that case (run at the next kiro-native launch
+    in the same workspace).
+
+    :param session_id: Session/conversation id.
+    """
+    path = _KIRO_AGENT_PROFILE_FILES.pop(session_id, None)
+    if path is None:
+        return
+    from omnigent.harnesses.kiro_native.bridge import cleanup_kiro_agent_profile
+
+    cleanup_kiro_agent_profile(path)
 
 
 async def _persist_qwen_external_session_id(
@@ -7911,6 +7972,7 @@ async def _launch_kiro(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 

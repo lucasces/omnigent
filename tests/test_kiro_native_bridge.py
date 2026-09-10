@@ -17,12 +17,17 @@ from omnigent.harnesses.kiro_native.bridge import (
     KIRO_NATIVE_BRIDGE_DIR_ENV_VAR,
     acp_record_path,
     build_kiro_native_terminal_env,
+    cleanup_kiro_agent_profile,
     inject_user_message,
+    kiro_agent_profile_name,
+    kiro_agent_profile_path,
     navigate_to_kiro_subagent_trust_scope,
     send_kiro_permission_reject_with_feedback,
     send_kiro_permission_verdict,
     send_kiro_subagent_permission_verdict,
+    sweep_orphaned_kiro_agent_profiles,
     write_forwarder_ready,
+    write_kiro_agent_profile,
     write_tmux_target,
 )
 
@@ -1151,3 +1156,117 @@ def test_inject_user_message_surfaces_kiro_cli_argv_error(
 
     with pytest.raises(RuntimeError, match="Conflicting options"):
         inject_user_message(bridge_dir, content="hello", timeout_s=0.1)
+
+
+def test_kiro_agent_profile_name_is_deterministic_and_unique_per_session() -> None:
+    """
+    Same session id -> same profile name; different sessions -> different
+    names.
+
+    This is the collision fix for the fixed-name approach
+    (``write_kiro_workspace_mcp_config``'s shared ``.kiro/settings/mcp.json``
+    keyed by the constant server name "omnigent"): multiple concurrent
+    sessions sharing one workspace (e.g. a coordinator and its specialists)
+    must never write to the same ``.kiro/agents/<name>.json``.
+    """
+    name_a1 = kiro_agent_profile_name("conv_a")
+    name_a2 = kiro_agent_profile_name("conv_a")
+    name_b = kiro_agent_profile_name("conv_b")
+
+    assert name_a1 == name_a2
+    assert name_a1 != name_b
+
+
+def test_write_kiro_agent_profile_writes_expected_schema(tmp_path: Path) -> None:
+    """The written profile matches kiro-cli's ``{prompt, resources}`` schema."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    path = write_kiro_agent_profile(workspace, "conv_abc", prompt="You are helpful.")
+
+    assert path == kiro_agent_profile_path(workspace, "conv_abc")
+    assert path.parent == workspace / ".kiro" / "agents"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == {"prompt": "You are helpful.", "resources": []}
+
+
+def test_write_kiro_agent_profile_avoids_cross_session_collision(tmp_path: Path) -> None:
+    """
+    Two concurrent sessions in the SAME workspace get two independent files.
+
+    Regression guard for the exact collision ``write_kiro_workspace_mcp_config``
+    has today (see that function's docstring): writing session B's profile
+    must not clobber session A's.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    path_a = write_kiro_agent_profile(workspace, "conv_a", prompt="Agent A prompt")
+    path_b = write_kiro_agent_profile(workspace, "conv_b", prompt="Agent B prompt")
+
+    assert path_a != path_b
+    assert json.loads(path_a.read_text(encoding="utf-8"))["prompt"] == "Agent A prompt"
+    assert json.loads(path_b.read_text(encoding="utf-8"))["prompt"] == "Agent B prompt"
+
+
+def test_cleanup_kiro_agent_profile_removes_file(tmp_path: Path) -> None:
+    """Cleanup removes the exact file a session wrote."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = write_kiro_agent_profile(workspace, "conv_abc", prompt="hi")
+    assert path.exists()
+
+    cleanup_kiro_agent_profile(path)
+
+    assert not path.exists()
+
+
+def test_cleanup_kiro_agent_profile_is_idempotent_when_missing(tmp_path: Path) -> None:
+    """Cleaning up a path that was never written (or already removed) is a no-op."""
+    missing = tmp_path / "workspace" / ".kiro" / "agents" / "omnigent-does-not-exist.json"
+
+    cleanup_kiro_agent_profile(missing)  # must not raise
+
+
+def test_sweep_orphaned_kiro_agent_profiles_removes_only_stale_omnigent_files(
+    tmp_path: Path,
+) -> None:
+    """
+    The orphan sweep removes only old, omnigent-prefixed profiles.
+
+    A fresh omnigent-prefixed file (a live session's own profile) and any
+    user-authored profile (no matter its age) are left untouched — the
+    sweep must never delete a hand-authored kiro-cli agent.
+    """
+    import os
+    import time
+
+    workspace = tmp_path / "workspace"
+    agents_dir = workspace / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+
+    stale = agents_dir / "omnigent-deadbeef.json"
+    stale.write_text("{}", encoding="utf-8")
+    fresh = agents_dir / "omnigent-cafef00d.json"
+    fresh.write_text("{}", encoding="utf-8")
+    user_owned = agents_dir / "my-custom-agent.json"
+    user_owned.write_text("{}", encoding="utf-8")
+
+    old_time = time.time() - (25 * 60 * 60)
+    os.utime(stale, (old_time, old_time))
+    os.utime(user_owned, (old_time, old_time))
+
+    removed = sweep_orphaned_kiro_agent_profiles(workspace)
+
+    assert removed == 1
+    assert not stale.exists()
+    assert fresh.exists()
+    assert user_owned.exists()
+
+
+def test_sweep_orphaned_kiro_agent_profiles_no_agents_dir_is_a_noop(tmp_path: Path) -> None:
+    """A workspace with no ``.kiro/agents`` dir yet sweeps cleanly to zero."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert sweep_orphaned_kiro_agent_profiles(workspace) == 0

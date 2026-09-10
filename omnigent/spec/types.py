@@ -589,6 +589,22 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         :class:`ProviderAuth` (a named generic provider from
         ``~/.omnigent/config.yaml``). ``None`` means fall back to
         environment variable / profile defaults.
+    :param kiro_agent_profile: Opt-in, kiro-native-only. When ``True``
+        and the agent declares non-empty ``instructions`` (YAML
+        ``prompt:``), the kiro-native launch path writes a per-session
+        kiro-cli agent profile to
+        ``<workspace>/.kiro/agents/<unique name>.json`` (schema
+        ``{"prompt": <instructions>, "resources": []}``) and launches
+        ``kiro-cli`` with ``--agent <unique name>`` so the TUI runs
+        under that instructions-driven persona instead of kiro's
+        default agent. The file name is derived from the session id so
+        concurrent sessions sharing one workspace (e.g. a coordinator
+        and its specialists) never collide on it, and it is removed on
+        session teardown
+        (``omnigent.harnesses.kiro_native.bridge.cleanup_kiro_agent_profile``).
+        **Defaults to ``False``.** No-op for every harness other than
+        kiro-native, and a no-op for kiro-native itself when
+        ``instructions`` is empty or unset.
     """
 
     type: str = "omnigent"
@@ -621,6 +637,9 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     # Takes precedence over ambient env vars and profile auto-detection.
     # None = fall back to env vars / profile defaults.
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None
+    # Opt-in, kiro-native-only agent-profile launch. See the
+    # kiro_agent_profile docstring param above.
+    kiro_agent_profile: bool = False
 
     @property
     def harness_kind(self) -> str:

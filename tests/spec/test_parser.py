@@ -140,6 +140,44 @@ def test_parse_executor_reasoning_effort_supersedes_llm(tmp_path: Path) -> None:
     assert spec.llm.extra.get("reasoning_effort") == "high"
 
 
+def test_parse_executor_kiro_agent_profile_defaults_to_false(agent_dir: Path) -> None:
+    """
+    Without ``executor.kiro_agent_profile:`` the parsed flag is ``False``.
+
+    A regression flipping this default would make every kiro-native
+    session (not just opted-in ones) write a per-session
+    ``.kiro/agents/<name>.json`` profile and launch kiro-cli with
+    ``--agent``, silently changing kiro-native-ui's behavior.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    spec = parse(agent_dir)
+    assert spec.executor.kiro_agent_profile is False
+
+
+def test_parse_executor_kiro_agent_profile_true(tmp_path: Path) -> None:
+    """
+    ``executor.kiro_agent_profile: true`` round-trips to
+    ``ExecutorSpec.kiro_agent_profile``.
+
+    This is the only signal the kiro-native launch path uses to decide
+    whether to write a per-session kiro-cli agent profile (see
+    ``omnigent.runner.native.orchestration._auto_create_kiro_terminal``);
+    a parser regression dropping the field would mean the YAML opt-in has
+    no effect.
+
+    :param tmp_path: pytest-provided temporary directory.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "kiro-agent",
+        "executor": {"kiro_agent_profile": True},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.kiro_agent_profile is True
+
+
 def test_parse_llm_missing_model(tmp_path: Path) -> None:
     config = {"spec_version": 1, "llm": {"max_completion_tokens": 100}}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))

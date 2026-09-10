@@ -191,16 +191,25 @@ def build_kiro_launch(
     model: str | None = None,
     prompt: str | None = None,
     resume_id: str | None = None,
+    agent: str | None = None,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] | None = None,
 ) -> NativeKiroLaunch:
-    """Build the argv for a native Kiro TUI process."""
+    """Build the argv for a native Kiro TUI process.
+
+    :param agent: Optional kiro-cli agent profile name (``--agent <name>``),
+        selecting a ``.kiro/agents/<name>.json`` profile written by the
+        caller. See ``ExecutorSpec.kiro_agent_profile``. ``None`` launches
+        kiro-cli's default agent.
+    """
     executable = resolve_kiro_executable(env=env, which=which)
     argv = [executable, "chat", "--tui"]
     if resume_id:
         argv.extend(["--resume-id", resume_id])
     if model:
         argv.extend(["--model", model])
+    if agent:
+        argv.extend(["--agent", agent])
     argv.extend(kiro_args)
     if prompt:
         argv.append(prompt)
