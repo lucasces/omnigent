@@ -304,27 +304,50 @@ def sweep_orphaned_kiro_agent_profiles(workspace: Path) -> int:
     return removed
 
 
-def write_kiro_agent_profile(workspace: Path, session_id: str, *, prompt: str) -> Path:
+def write_kiro_agent_profile(
+    workspace: Path, session_id: str, *, prompt: str, description: str = ""
+) -> Path:
     """Write the per-session kiro-cli agent profile declaring *prompt*.
 
     kiro-cli's ``--agent <name>`` flag selects a named profile from
-    ``<workspace>/.kiro/agents/<name>.json``. Schema is
-    ``{"prompt": <system prompt>, "resources": [...]}``; resources are
-    left empty for now. Written atomically (tmp + os.replace), mirroring
-    ``write_kiro_workspace_mcp_config``. Sweeps orphaned profiles from
-    prior crashed sessions in this workspace first (best-effort; see
+    ``<workspace>/.kiro/agents/<name>.json``. The payload follows the
+    full agent-config schema kiro-cli itself emits via
+    ``kiro-cli agent create`` (confirmed against kiro-cli 2.20.1) --
+    notably ``name`` is a *required* field. kiro-cli silently falls back
+    to its built-in default agents (``kiro_default``/``kiro_planner``/
+    ``kiro_help``) whenever a profile fails to parse instead of aborting,
+    so a profile missing required fields never surfaced as a launch
+    error -- only as the wrong persona being active. Written atomically
+    (tmp + os.replace), mirroring ``write_kiro_workspace_mcp_config``.
+    Sweeps orphaned profiles from prior crashed sessions in this
+    workspace first (best-effort; see
     ``sweep_orphaned_kiro_agent_profiles``).
 
     :param workspace: The kiro-cli workspace root.
     :param session_id: Session/conversation id; keys the unique filename.
     :param prompt: The agent's system prompt (``AgentSpec.instructions``).
+    :param description: The agent's description (``AgentSpec.description``),
+        if any.
     :returns: The written profile's path. The profile *name* to pass to
         ``--agent`` is ``kiro_agent_profile_name(session_id)``.
     """
     sweep_orphaned_kiro_agent_profiles(workspace)
     path = kiro_agent_profile_path(workspace, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload: _JsonObject = {"prompt": prompt, "resources": []}
+    payload: _JsonObject = {
+        "name": kiro_agent_profile_name(session_id),
+        "description": description,
+        "prompt": prompt,
+        "mcpServers": {},
+        "tools": ["*"],
+        "toolAliases": {},
+        "allowedTools": [],
+        "resources": [],
+        "toolsSettings": {},
+        "includeMcpJson": True,
+        "model": None,
+        "permissions": {"rules": []},
+    }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)

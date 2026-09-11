@@ -576,7 +576,20 @@ async def test_auto_create_kiro_terminal_agent_profile_opt_in_writes_profile_and
     profile_path = tmp_path / ".kiro" / "agents" / f"{expected_name}.json"
     assert profile_path.exists()
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
-    assert payload == {"prompt": "You are Work, a coordinator.", "resources": []}
+    assert payload == {
+        "name": expected_name,
+        "description": "",
+        "prompt": "You are Work, a coordinator.",
+        "mcpServers": {},
+        "tools": ["*"],
+        "toolAliases": {},
+        "allowedTools": [],
+        "resources": [],
+        "toolsSettings": {},
+        "includeMcpJson": True,
+        "model": None,
+        "permissions": {"rules": []},
+    }
 
     spec = ctx["spec"]
     assert "--agent" in spec.args

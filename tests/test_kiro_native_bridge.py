@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1178,16 +1179,83 @@ def test_kiro_agent_profile_name_is_deterministic_and_unique_per_session() -> No
 
 
 def test_write_kiro_agent_profile_writes_expected_schema(tmp_path: Path) -> None:
-    """The written profile matches kiro-cli's ``{prompt, resources}`` schema."""
+    """
+    The written profile matches kiro-cli 2.20.1's real agent-config schema.
+
+    Confirmed against the actual binary via ``kiro-cli agent create`` /
+    ``kiro-cli agent validate`` (see
+    ``test_write_kiro_agent_profile_passes_real_kiro_cli_validation`` below
+    for the binary-backed check). Critically, ``name`` is *required* --
+    kiro-cli silently falls back to its built-in default agents when a
+    profile is missing it, instead of raising, so this was the actual
+    root cause of ``kiro_agent_profile`` never taking effect.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    path = write_kiro_agent_profile(
+        workspace, "conv_abc", prompt="You are helpful.", description="A helpful agent."
+    )
+
+    assert path == kiro_agent_profile_path(workspace, "conv_abc")
+    assert path.parent == workspace / ".kiro" / "agents"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == {
+        "name": kiro_agent_profile_name("conv_abc"),
+        "description": "A helpful agent.",
+        "prompt": "You are helpful.",
+        "mcpServers": {},
+        "tools": ["*"],
+        "toolAliases": {},
+        "allowedTools": [],
+        "resources": [],
+        "toolsSettings": {},
+        "includeMcpJson": True,
+        "model": None,
+        "permissions": {"rules": []},
+    }
+
+
+def test_write_kiro_agent_profile_defaults_description_to_empty_string(
+    tmp_path: Path,
+) -> None:
+    """``description`` is optional; omitting it writes an empty string, not null."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
     path = write_kiro_agent_profile(workspace, "conv_abc", prompt="You are helpful.")
 
-    assert path == kiro_agent_profile_path(workspace, "conv_abc")
-    assert path.parent == workspace / ".kiro" / "agents"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload == {"prompt": "You are helpful.", "resources": []}
+    assert payload["description"] == ""
+    assert payload["name"] == kiro_agent_profile_name("conv_abc")
+
+
+@pytest.mark.skipif(shutil.which("kiro-cli") is None, reason="kiro-cli binary not on PATH")
+def test_write_kiro_agent_profile_passes_real_kiro_cli_validation(tmp_path: Path) -> None:
+    """
+    Regression guard for the actual bug: kiro-cli must accept the written
+    profile via its own ``agent validate`` subcommand.
+
+    The prior schema (``{"prompt": ..., "resources": []}``) fails this
+    exact check with ``missing field `name` ``, but kiro-cli falls back
+    to a default built-in persona instead of surfacing that error during
+    normal launch -- this is the only check in the suite that would have
+    caught it directly against the real binary.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    path = write_kiro_agent_profile(workspace, "conv_abc", prompt="You are helpful.")
+
+    result = subprocess.run(
+        ["kiro-cli", "agent", "validate", "--path", str(path)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "missing field" not in result.stderr
 
 
 def test_write_kiro_agent_profile_avoids_cross_session_collision(tmp_path: Path) -> None:

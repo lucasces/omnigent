@@ -3199,7 +3199,10 @@ async def _auto_create_kiro_terminal(
         agent_prompt = (spec.instructions or "").strip()
         if agent_prompt:
             profile_path = write_kiro_agent_profile(
-                workspace_path, session_id, prompt=agent_prompt
+                workspace_path,
+                session_id,
+                prompt=agent_prompt,
+                description=(spec.description or "").strip(),
             )
             _KIRO_AGENT_PROFILE_FILES[session_id] = profile_path
             kiro_agent_name = kiro_agent_profile_name(session_id)
