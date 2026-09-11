@@ -9274,8 +9274,8 @@ def create_runner_app(
         ):
             # Each native harness contributes only the ensure hooks that differ
             # from the uniform base; a single _ensure_native_terminal call runs
-            # them. The 4 uniform harnesses (goose/kiro/hermes/qwen) need only the
-            # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
+            # them. The 3 uniform harnesses (goose/hermes/qwen) need only the
+            # base context; pi/opencode/cursor/kimi/kiro/claude resolve an agent spec
             # via build_context; codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
             _ensure_locks = {
@@ -9390,7 +9390,7 @@ def create_runner_app(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi"):
+            elif terminal_name in ("cursor", "kimi", "kiro"):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -10423,7 +10423,7 @@ def create_runner_app(
     async def _resolve_session_agent_spec_or_none(session_id: str) -> AgentSpec | None:
         """Resolve the session agent spec, tolerating resolution failure.
 
-        The cursor/opencode/kimi launch arms swallow ``OmnigentError`` and
+        The cursor/opencode/kimi/kiro launch arms swallow ``OmnigentError`` and
         continue without a spec; this is their spec resolver for
         ``_launch_native_terminal``.
         """

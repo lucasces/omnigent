@@ -543,6 +543,140 @@ async def test_create_session_terminal_ensure_routes_codex_native(
 
 
 @pytest.mark.asyncio
+async def test_create_session_terminal_ensure_routes_kiro_native_agent_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``POST /resources/terminals`` ensure path resolves an agent spec for kiro.
+
+    Regression test for the reconnect gap fixed alongside commit 9e6df68dc
+    (``executor.kiro_agent_profile``): the ensure route's ``terminal_name``
+    dispatch had no arm for ``"kiro"``, so ``_ensure_build`` stayed ``None``
+    and ``ctx.agent_spec`` stayed ``None`` on reconnect \u2014
+    ``_auto_create_kiro_terminal`` never got the session's resolved spec, so
+    a session with ``executor.kiro_agent_profile: true`` lost its per-session
+    kiro-cli agent profile every time the terminal was re-attached rather
+    than freshly created via session-create. Kiro must resolve the spec the
+    same way cursor/kimi do on ensure (``_resolve_session_agent_spec_or_none``),
+    not fall through with no ``_ensure_build`` at all.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    sid = "kiro0ensure123456789abcdef012345"
+    agent_id = "kiro-coordinator-agent-0001"
+    auto_create_calls: list[str] = []
+    auto_create_kwargs: list[dict[str, object]] = []
+
+    async def _stub_auto_create(
+        session_id: str,
+        resource_registry: object,
+        publish_event: object,
+        **kwargs: object,
+    ) -> SessionResourceView:
+        """Record the kiro-native ensure path instead of launching a real TUI.
+
+        :param session_id: Session id being ensured.
+        :param resource_registry: Runner resource registry collaborator (unused).
+        :param publish_event: Runner event publisher collaborator (unused).
+        :param kwargs: Additional keyword arguments, notably ``agent_spec``.
+        :returns: Tagged terminal resource view.
+        """
+        del resource_registry, publish_event
+        auto_create_calls.append(session_id)
+        auto_create_kwargs.append(kwargs)
+        return SessionResourceView(
+            id=terminal_resource_id("kiro", "main"),
+            type="terminal",
+            session_id=session_id,
+            name="auto-created",
+        )
+
+    async def _stub_get_terminal(
+        self: object,
+        session_id: str,
+        terminal_id: str,
+    ) -> SessionResourceView | None:
+        """No terminal registered yet, forcing the ensure route to auto-create.
+
+        :param self: Bound registry instance.
+        :param session_id: Session id being queried.
+        :param terminal_id: Terminal resource id being queried.
+        :returns: Always ``None`` \u2014 this test only covers the auto-create arm.
+        """
+        del self, session_id, terminal_id
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_kiro_terminal", _stub_auto_create
+    )
+    monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
+
+    kiro_spec = AgentSpec(
+        spec_version=1,
+        name="kiro-coordinator",
+        instructions="You are the kiro coordinator persona.",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "kiro-native"},
+            kiro_agent_profile=True,
+        ),
+    )
+
+    async def _resolver(resolved_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the fixed kiro-native spec for the session's agent id.
+
+        :param resolved_agent_id: Agent id the runner resolved from the
+            session snapshot, e.g. ``"kiro-coordinator-agent-0001"``.
+        :param session_id: Session id being resolved (unused \u2014 fixed spec).
+        :returns: The parametrized kiro-native :class:`AgentSpec`.
+        """
+        del session_id
+        assert resolved_agent_id == agent_id
+        return kiro_spec
+
+    class _AgentIdServerClient(NullServerClient):
+        """Server-client stub answering the session snapshot GET with an agent id."""
+
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            """Return ``agent_id`` for the session snapshot GET, else the base stub.
+
+            :param url: Request path, e.g. ``"/v1/sessions/<sid>"``.
+            :param kwargs: Extra keyword arguments passed through to the base stub.
+            :returns: A response exposing ``status_code`` and ``json()``.
+            """
+            if url == f"/v1/sessions/{sid}":
+
+                class _Response(NullServerClient._Response):
+                    def json(self) -> dict[str, Any]:
+                        return {"agent_id": agent_id}
+
+                return _Response()
+            return await super().get(url, **kwargs)
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_AgentIdServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{sid}/resources/terminals",
+            json={"terminal": "kiro", "session_key": "main", "ensure_native_terminal": True},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "auto-created"
+    assert auto_create_calls == [sid]
+    assert auto_create_kwargs[0]["server_client"] is not None
+    # The regression: without a kiro ensure arm, agent_spec stayed None and
+    # _auto_create_kiro_terminal never wrote the per-session kiro-cli agent
+    # profile on reconnect.
+    assert auto_create_kwargs[0]["agent_spec"] is kiro_spec
+
+
+@pytest.mark.asyncio
 async def test_late_status_for_deleted_sub_agent_child_is_not_a_spurious_503() -> None:
     """
     A terminal status arriving after a sub-agent child is deleted is a no-op.
