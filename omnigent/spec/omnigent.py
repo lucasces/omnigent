@@ -1754,6 +1754,11 @@ def _translate_executor_from_def(
     # ``HARNESS_OPENAI_AGENTS_USE_RESPONSES``, which controls
     # whether the inner executor uses /responses or /chat/completions.
     # ``use_responses`` is carried via raw_executor when present
+    # ``kiro_agent_profile`` is not a field on the omnigent inner
+    # ExecutorSpec either (same reasoning as use_responses/acp_agent
+    # above); default False, overridden from raw_executor below when
+    # the source YAML declares the opt-in flag.
+    kiro_agent_profile = False
     if raw_executor is not None:
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
@@ -1762,6 +1767,8 @@ def _translate_executor_from_def(
             config["reasoning_item_id_policy"] = raw_executor["reasoning_item_id_policy"]
         if "acp_agent" in raw_executor:
             config["acp_agent"] = raw_executor["acp_agent"]
+        if "kiro_agent_profile" in raw_executor:
+            kiro_agent_profile = bool(raw_executor["kiro_agent_profile"])
     # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;
     # fall back to raw_executor for the top-level agent path that still
     # goes through _translate_executor_from_def(raw_executor=...).
@@ -1791,6 +1798,7 @@ def _translate_executor_from_def(
         model=model or None,
         profile=profile or None,
         auth=auth,
+        kiro_agent_profile=kiro_agent_profile,
     )
 
 

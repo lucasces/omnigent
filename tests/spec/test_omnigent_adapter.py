@@ -850,6 +850,52 @@ def test_load_omnigent_yaml_routes_to_adapter(
     assert spec.executor.config["harness"] == "claude-sdk"
 
 
+def test_load_omnigent_yaml_kiro_agent_profile_survives_real_pipeline(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression: ``executor.kiro_agent_profile: true`` in a real
+    omnigent single-file YAML survives the actual ``omnigent.spec.load()``
+    pipeline (dispatch -> ``load_omnigent_yaml`` -> ``agent_def_to_agent_spec``
+    -> ``_translate_executor_from_def``), not just the newer
+    ``_parse_executor`` path used by native (non-omnigent-compat) specs.
+
+    ``_translate_executor_from_def`` builds the final :class:`ExecutorSpec`
+    from ``OmniExecutorSpec`` (``omnigent.inner.datamodel.ExecutorSpec``),
+    which has no ``kiro_agent_profile`` field at all -- the omnigent inner
+    loader silently drops it while parsing the YAML into an ``AgentDef``.
+    Without explicitly recovering it from the raw YAML dict (the same
+    pattern already used for ``use_responses``/``reasoning_item_id_policy``/
+    ``acp_agent``), the opt-in always resolved to the dataclass default
+    ``False`` for every kiro-native agent loaded through this dialect,
+    regardless of what the source YAML declared.
+
+    What breaks if this fails: every kiro-native agent bundle authored in
+    the omnigent single-file YAML dialect (as opposed to the native
+    ``spec_version``-declaring dialect) silently loses the
+    ``executor.kiro_agent_profile: true`` opt-in at load time -- the
+    per-session kiro-cli agent profile is never written and kiro-cli
+    always falls back to its default personas, no matter how the runner's
+    ``/terminals/ensure`` or session-create paths resolve the spec.
+    """
+    config = {
+        "name": "kiro_agent_profile_example",
+        "prompt": "You are the kiro coordinator persona.",
+        "executor": {
+            "harness": "kiro-native",
+            "kiro_agent_profile": True,
+        },
+    }
+    path = tmp_path / "kiro_agent_profile.yaml"
+    path.write_text(yaml.dump(config))
+
+    spec = load(path)
+
+    assert spec.executor.type == OMNIGENT_EXECUTOR_TYPE
+    assert spec.executor.config["harness"] == "kiro-native"
+    assert spec.executor.kiro_agent_profile is True
+
+
 def test_load_omnigent_directory_uses_existing_parser(
     omnigent_spec_dir: Path,
 ) -> None:
