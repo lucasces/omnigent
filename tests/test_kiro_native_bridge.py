@@ -23,9 +23,11 @@ from omnigent.harnesses.kiro_native.bridge import (
     kiro_agent_profile_name,
     kiro_agent_profile_path,
     navigate_to_kiro_subagent_trust_scope,
+    navigate_to_kiro_trust_scope,
     send_kiro_permission_reject_with_feedback,
     send_kiro_permission_verdict,
     send_kiro_subagent_permission_verdict,
+    send_kiro_trust_scope_verdict,
     sweep_orphaned_kiro_agent_profiles,
     write_forwarder_ready,
     write_kiro_agent_profile,
@@ -64,6 +66,10 @@ _PERMISSION_PANE_NO_TRUST_OPTION_REJECT_FOCUSED = _PERMISSION_PANE_NO_TRUST_OPTI
     "❯ Yes, single permission\n   No (Tab to edit)",
     "  Yes, single permission\n ❯ No (Tab to edit)",
 )
+# No row carries a "❯" marker at all (mid tmux redraw, or a Kiro render this
+# bridge doesn't recognize) — used to confirm the focus-detection rewrite
+# still fails closed instead of guessing a row when it genuinely can't tell.
+_PERMISSION_PANE_NO_FOCUS = _PERMISSION_PANE.replace("❯ Yes,", "  Yes,")
 # Pressing Tab on the focused "No (Tab to edit)" row swaps the picker for
 # Kiro's own free-text "Modify request" editor (captured verbatim from a live
 # kiro-cli 2.17.0 pane).
@@ -187,6 +193,25 @@ _AGENT_MONITOR_SLEEP2_TRUST_SCOPE = """
    Base command       sleep *
    Entire tool
 """
+# Top-level (non-subagent) counterpart of _AGENT_MONITOR_SLEEP2_TRUST_SCOPE,
+# opened by selecting "Trust, always allow" on the plain modal prompt (see
+# navigate_to_kiro_trust_scope).
+_TRUST_SCOPE_PANE = """
+────────────────────────────────────────────────────────────────────────────
+↓ Shell pwd
+
+shell requires approval · trust options
+❯ Full command       sleep 5
+  Partial command    sleep 5 *
+  Base command       sleep *
+  Entire tool
+────────────────────────────────────────────────────────────────────────────
+esc to close
+"""
+_TRUST_SCOPE_PANE_BASE_FOCUSED = _TRUST_SCOPE_PANE.replace(
+    "❯ Full command       sleep 5\n  Partial command    sleep 5 *\n  Base command       sleep *",
+    "  Full command       sleep 5\n  Partial command    sleep 5 *\n❯ Base command       sleep *",
+)
 
 
 def _install_fake_tmux(
@@ -501,6 +526,128 @@ def test_send_kiro_permission_verdict_refuses_allow_always_when_focus_stays_on_o
     assert sent_keys == ["Down"]
 
 
+def test_navigate_to_kiro_trust_scope_sends_single_down_from_default_focus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE_TRUST_FOCUSED, _TRUST_SCOPE_PANE],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    rows = navigate_to_kiro_trust_scope(bridge_dir, timeout_s=0.5)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Down", "Enter"]
+    assert rows[0].startswith("Full command")
+
+
+def test_navigate_to_kiro_trust_scope_navigates_up_when_focus_starts_on_reject(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the real incident: a live prompt was observed
+    starting focused on "No" instead of "Yes,". The old code always sent a
+    single hardcoded Down from an assumed Yes start, which can never reach
+    "Trust," from "No" — this must compute the Up presses needed from
+    whatever row is actually observed focused.
+    """
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_REJECT_FOCUSED,
+            _PERMISSION_PANE_TRUST_FOCUSED,
+            _TRUST_SCOPE_PANE,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    rows = navigate_to_kiro_trust_scope(bridge_dir, timeout_s=0.5)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Up", "Enter"]
+    assert rows[0].startswith("Full command")
+
+
+def test_navigate_to_kiro_trust_scope_sends_no_keys_when_already_focused_on_trust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_TRUST_FOCUSED,
+            _PERMISSION_PANE_TRUST_FOCUSED,
+            _TRUST_SCOPE_PANE,
+        ],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    rows = navigate_to_kiro_trust_scope(bridge_dir, timeout_s=0.5)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Enter"]
+    assert rows[0].startswith("Full command")
+
+
+def test_send_kiro_trust_scope_verdict_selects_target_from_default_focus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_TRUST_SCOPE_PANE, _TRUST_SCOPE_PANE_BASE_FOCUSED],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_trust_scope_verdict(bridge_dir, option_index=2, timeout_s=0.5)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Down", "Down", "Enter"]
+
+
+def test_send_kiro_trust_scope_verdict_navigates_up_when_focus_starts_past_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: the old code always counted Downs from an assumed row
+    0, so it could never reach an earlier row if the submenu happened to
+    render already focused past the target — this must navigate relative to
+    whichever row is actually observed focused.
+    """
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_TRUST_SCOPE_PANE_BASE_FOCUSED, _TRUST_SCOPE_PANE],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_trust_scope_verdict(bridge_dir, option_index=0, timeout_s=0.5)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Up", "Up", "Enter"]
+
+
 def test_send_kiro_permission_verdict_requires_visible_permission_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -518,13 +665,73 @@ def test_send_kiro_permission_verdict_requires_visible_permission_prompt(
         send_kiro_permission_verdict(bridge_dir, action="accept", timeout_s=0.01)
 
 
-def test_send_kiro_permission_verdict_refuses_when_focus_moved_to_trust(
+def test_send_kiro_permission_verdict_accepts_when_focus_starts_on_trust(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Accept navigates Up from a live prompt observed starting on Trust.
+
+    Regression test: the old code required the prompt to start focused on
+    "Yes," (anything else just spun until timeout without sending a
+    keystroke). Navigation is now computed relative to whatever row is
+    actually observed focused.
+    """
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE_TRUST_FOCUSED, _PERMISSION_PANE],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_permission_verdict(bridge_dir, action="accept", timeout_s=0.1)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Up", "Enter"]
+
+
+def test_send_kiro_permission_verdict_accepts_when_focus_starts_on_reject(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accept navigates Up-Up from a live prompt observed starting on No.
+
+    This is the real incident this fix addresses: Kiro rendered a live
+    approval prompt already focused on "No (Tab to edit)" instead of "Yes,".
+    The old code only ever knew how to count Downs from an assumed Yes
+    start, so it could never reach "Yes," from there — it just spun until
+    timeout without sending a single keystroke, leaving the real terminal
+    wedged on that exact prompt.
+    """
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE_REJECT_FOCUSED, _PERMISSION_PANE],
+    )
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    send_kiro_permission_verdict(bridge_dir, action="accept", timeout_s=0.1)
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Up", "Up", "Enter"]
+
+
+def test_send_kiro_permission_verdict_requires_a_readable_focused_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Still fails closed when the prompt is visible but no row shows a focus marker.
+
+    The fix removes the *specific* "must start on Yes," requirement, not the
+    underlying safety property: with no recognizable focus at all, the bridge
+    must still refuse to guess a starting position and type blind.
+    """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
-    _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE_TRUST_FOCUSED])
+    _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE_NO_FOCUS])
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/tmux.sock"),

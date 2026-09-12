@@ -645,6 +645,68 @@ def _kiro_permission_focus_on_reject(pane: str) -> bool:
     return any(line.strip().startswith("❯ No") for line in pane.splitlines())
 
 
+# On-screen row order Kiro always uses when a given row is present: one-time
+# allow first, trust-always (if offered) second, one-time reject last. Only
+# *presence* of the middle row varies per prompt kind
+# (``KiroPermissionRequest.always_option_id``); the relative order of any two
+# present rows never does.
+_KIRO_PERMISSION_ROW_ORDER = ("allow", "trust", "reject")
+# Human-readable label per row, for RuntimeError messages only (kept distinct
+# from the internal "trust" key because existing callers/tests expect
+# "trust-always", matching Kiro's own option label).
+_KIRO_PERMISSION_OPTION_LABELS = {"allow": "allow", "trust": "trust-always", "reject": "reject"}
+
+
+def _kiro_permission_option_rows(has_trust_always_option: bool) -> tuple[str, ...]:
+    """Return this prompt's option rows in on-screen order.
+
+    Kiro omits "Trust, always allow" for some prompt kinds (2-row menu);
+    every other prompt offers all three (3-row menu). Never reorders: Kiro's
+    own layout only ever adds or removes the middle row.
+    """
+    if has_trust_always_option:
+        return _KIRO_PERMISSION_ROW_ORDER
+    return tuple(row for row in _KIRO_PERMISSION_ROW_ORDER if row != "trust")
+
+
+def _kiro_permission_focused_option(pane: str) -> str | None:
+    """Return which permission-picker row ("allow"/"trust"/"reject") is focused.
+
+    ``None`` when the picker isn't showing any recognizable focused row (mid
+    tmux redraw, or no row carries a "❯" marker at all) — callers treat that
+    as "don't know where we are" and fail closed rather than guess a
+    starting position. A live prompt has been observed starting focused on
+    "No" instead of the historical "always starts on Yes," assumption (see
+    ``_wait_for_kiro_permission_prompt``), which is why navigation below is
+    computed relative to whatever this returns, never a hardcoded row.
+    """
+    if _kiro_permission_focus_on_one_time_allow(pane):
+        return "allow"
+    if _kiro_permission_focus_on_always_allow(pane):
+        return "trust"
+    if _kiro_permission_focus_on_reject(pane):
+        return "reject"
+    return None
+
+
+def _send_kiro_picker_navigation_keys(
+    socket_path: str, tmux_target: str, *, current_index: int, target_index: int
+) -> None:
+    """Press Down/Up to move a Kiro list picker from *current_index* to *target_index*.
+
+    Shared by the top-level permission picker (``send_kiro_permission_verdict``,
+    ``navigate_to_kiro_trust_scope``) and the trust-scope submenu
+    (``send_kiro_trust_scope_verdict``) — both are plain single-select lists
+    where Down/Up move one row at a time. A zero delta sends no keys (the
+    picker is already on the target row).
+    """
+    delta = target_index - current_index
+    key = "Down" if delta > 0 else "Up"
+    for _ in range(abs(delta)):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+
+
 # Pressing Tab on the focused "No (Tab to edit)" row swaps the approve/reject
 # picker for Kiro's own "Modify request" editor — a free-text field
 # ("add your feedback...") whose submitted text rejects THIS tool call and
@@ -874,8 +936,8 @@ def _wait_for_kiro_permission_prompt(
     tmux_target: str,
     *,
     timeout_s: float,
-) -> None:
-    """Wait until Kiro has rendered an approval prompt before typing a verdict.
+) -> str:
+    """Wait until Kiro has rendered an approval prompt with a readable focus.
 
     Deliberately does not try to verify the visible prompt's *content*
     matches the ACP request we're answering. Kiro's TUI is strictly modal —
@@ -887,12 +949,27 @@ def _wait_for_kiro_permission_prompt(
     lines inside multi-line scripts) was the actual source of failures here,
     not a real ambiguity it was guarding against. Structural markers
     (fixed UI chrome strings that never wrap) are sufficient and robust.
+
+    Only requires *a* row to show a recognizable focus, not specifically
+    "Yes," — a live prompt has been observed starting focused on "No"
+    instead. Requiring "Yes," specifically here meant that prompt could
+    never be delivered at all: this function spun until *timeout_s* without
+    ever sending a keystroke, and every caller navigated with a hardcoded
+    "we start on Yes," assumption that could never be satisfied either.
+    Callers instead read the actual starting row off the returned pane via
+    ``_kiro_permission_focused_option`` and navigate relative to it.
+
+    :returns: The pane text this wait last captured, so callers can read the
+        starting focus off it without an extra capture (a fresh capture
+        could observe a different, also-valid state on a slow pane).
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(pane):
-            return
+        if _kiro_permission_prompt_active(pane) and (
+            _kiro_permission_focused_option(pane) is not None
+        ):
+            return pane
         time.sleep(_POLL_INTERVAL_S)
     raise RuntimeError(
         "kiro-native permission prompt was not safely focused before verdict delivery"
@@ -1130,10 +1207,18 @@ def send_kiro_permission_verdict(
 
     ``has_trust_always_option`` must reflect whether *this specific* prompt
     offered "Trust, always allow in this session" (i.e.
-    ``KiroPermissionRequest.always_option_id is not None``) — it controls how
-    many rows "No" sits below the default focus for ``decline``/``cancel``.
-    Defaults to ``True`` (the historical, 3-row assumption) for callers that
-    don't track this.
+    ``KiroPermissionRequest.always_option_id is not None``) — it determines
+    whether "No" is this prompt's second or third row (see
+    ``_kiro_permission_option_rows``). Defaults to ``True`` (the 3-row shape)
+    for callers that don't track this.
+
+    Navigates from whichever row the prompt is actually focused on when it
+    first becomes readable (see ``_wait_for_kiro_permission_prompt`` and
+    ``_kiro_permission_focused_option``), not a presumed starting row. A live
+    prompt has been observed starting focused on "No" instead of the
+    historical "always starts on Yes," assumption; computing Down/Up presses
+    relative to the *observed* row instead of a hardcoded one is what makes
+    that recoverable.
     """
     if action not in {"accept", "decline", "cancel", "allow_always"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
@@ -1144,63 +1229,43 @@ def send_kiro_permission_verdict(
         raise RuntimeError(
             "kiro terminal is no longer running (the TUI exited); restart the session"
         )
-    _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
-    if action == "accept":
-        time.sleep(_PERMISSION_ENTER_SETTLE_S)
-        pane = _wait_for_focus(
-            socket_path,
-            tmux_target,
-            focus_check=_kiro_permission_focus_on_one_time_allow,
-            timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
+    pane = _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
+    rows = _kiro_permission_option_rows(has_trust_always_option)
+    current_option = _kiro_permission_focused_option(pane)
+    target_option = {
+        "accept": "allow",
+        "allow_always": "trust",
+        "decline": "reject",
+        "cancel": "reject",
+    }[action]
+    if current_option not in rows or target_option not in rows:
+        raise RuntimeError(
+            f"kiro-native permission prompt has no {target_option!r} row for action "
+            f"{action!r} (observed focus={current_option!r}, "
+            f"has_trust_always_option={has_trust_always_option!r})"
         )
-        if not (
-            _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_one_time_allow(pane)
-        ):
-            raise RuntimeError("kiro-native allow option was not safely focused before delivery")
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-        time.sleep(_PERMISSION_KEY_INTERVAL_S)
-        return
-    if action == "allow_always":
-        # "Trust, always allow in this session" sits one row below the
-        # default one-time-allow focus (_wait_for_kiro_permission_prompt
-        # above already confirmed the prompt starts there), so a single Down
-        # lands on it.
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
-        time.sleep(_PERMISSION_KEY_INTERVAL_S)
-        pane = _wait_for_focus(
-            socket_path,
-            tmux_target,
-            focus_check=_kiro_permission_focus_on_always_allow,
-            timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
-        )
-        if not (
-            _kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_always_allow(pane)
-        ):
-            raise RuntimeError(
-                "kiro-native trust-always option was not safely focused before delivery"
-            )
-        time.sleep(_PERMISSION_ENTER_SETTLE_S)
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-        time.sleep(_PERMISSION_KEY_INTERVAL_S)
-        return
-    # decline / cancel: "No" sits one row below the default one-time-allow
-    # focus when Kiro also offered "Trust, always allow" (3-row menu), or
-    # directly below it otherwise (2-row menu — see ``has_trust_always_option``).
-    # Sending a fixed two Downs regardless used to overshoot "No" on a 2-row
-    # menu and land back on nothing recognizable, permanently abandoning the
-    # decline instead of just landing correctly.
-    down_presses = 2 if has_trust_always_option else 1
-    for _ in range(down_presses):
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
-        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    _send_kiro_picker_navigation_keys(
+        socket_path,
+        tmux_target,
+        current_index=rows.index(current_option),
+        target_index=rows.index(target_option),
+    )
+    focus_check = {
+        "allow": _kiro_permission_focus_on_one_time_allow,
+        "trust": _kiro_permission_focus_on_always_allow,
+        "reject": _kiro_permission_focus_on_reject,
+    }[target_option]
     pane = _wait_for_focus(
         socket_path,
         tmux_target,
-        focus_check=_kiro_permission_focus_on_reject,
+        focus_check=focus_check,
         timeout_s=_PERMISSION_FOCUS_RETRY_TIMEOUT_S,
     )
-    if not (_kiro_permission_prompt_active(pane) and _kiro_permission_focus_on_reject(pane)):
-        raise RuntimeError("kiro-native reject option was not safely focused before delivery")
+    if not (_kiro_permission_prompt_active(pane) and focus_check(pane)):
+        raise RuntimeError(
+            f"kiro-native {_KIRO_PERMISSION_OPTION_LABELS[target_option]} option was not "
+            "safely focused before delivery"
+        )
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     time.sleep(_PERMISSION_KEY_INTERVAL_S)
@@ -1414,9 +1479,13 @@ def navigate_to_kiro_trust_scope(
         raise RuntimeError(
             "kiro terminal is no longer running (the TUI exited); restart the session"
         )
-    _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
-    time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _wait_for_kiro_permission_prompt(socket_path, tmux_target, timeout_s=timeout_s)
+    _send_kiro_picker_navigation_keys(
+        socket_path,
+        tmux_target,
+        current_index=_KIRO_PERMISSION_ROW_ORDER.index(_kiro_permission_focused_option(pane)),
+        target_index=_KIRO_PERMISSION_ROW_ORDER.index("trust"),
+    )
     pane = _wait_for_focus(
         socket_path,
         tmux_target,
@@ -1468,17 +1537,23 @@ def send_kiro_trust_scope_verdict(
             "kiro terminal is no longer running (the TUI exited); restart the session"
         )
     deadline = time.monotonic() + timeout_s
+    current_index: int | None = None
     while time.monotonic() < deadline:
-        if _kiro_trust_scope_active(_capture_pane(socket_path, tmux_target)):
-            break
+        pane = _capture_pane(socket_path, tmux_target)
+        if _kiro_trust_scope_active(pane):
+            current_index = _kiro_trust_scope_focused_index(pane)
+            if current_index is not None:
+                break
         time.sleep(_POLL_INTERVAL_S)
-    else:
+    if current_index is None:
         raise RuntimeError(
             "kiro-native trust-scope submenu was not visible before verdict delivery"
         )
-    for _ in range(option_index):
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Down")
-        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    # Navigate relative to the observed row, not a presumed row 0 (same fix
+    # as ``send_kiro_permission_verdict``).
+    _send_kiro_picker_navigation_keys(
+        socket_path, tmux_target, current_index=current_index, target_index=option_index
+    )
     pane = _wait_for_focus(
         socket_path,
         tmux_target,
