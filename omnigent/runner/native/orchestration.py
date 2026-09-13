@@ -3280,6 +3280,7 @@ async def _auto_create_kiro_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 expected_session_id=launch_config.external_session_id,
+                expected_kiro_agent_name=kiro_agent_name,
                 auth=_runner_auth,
             ),
             supervise_kiro_permission_mirror(

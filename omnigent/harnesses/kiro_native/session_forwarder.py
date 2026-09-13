@@ -43,10 +43,18 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 
 @dataclass
 class _ForwardState:
-    """Durable cursor for one Kiro JSONL session file."""
+    """Durable cursor for one Kiro JSONL session file.
+
+    :ivar agent_name: The kiro-cli agent profile name (``kiro_agent_profile_name``)
+        this state was bound under, when discovery had one to match against.
+        Purely informational today (a future re-check could compare it against
+        the bound JSONL's own ``session_state.agent_name`` to detect drift);
+        not read back by discovery itself.
+    """
 
     session_id: str | None = None
     byte_offset: int = 0
+    agent_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,9 +112,11 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
         return _ForwardState()
     session_id = data.get("session_id")
     byte_offset = data.get("byte_offset")
+    agent_name = data.get("agent_name")
     return _ForwardState(
         session_id=session_id if isinstance(session_id, str) and session_id else None,
         byte_offset=byte_offset if isinstance(byte_offset, int) and byte_offset >= 0 else 0,
+        agent_name=agent_name if isinstance(agent_name, str) and agent_name else None,
     )
 
 
@@ -117,7 +127,13 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         os.chmod(bridge_dir, 0o700)
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     tmp.write_text(
-        json.dumps({"session_id": state.session_id, "byte_offset": state.byte_offset}),
+        json.dumps(
+            {
+                "session_id": state.session_id,
+                "byte_offset": state.byte_offset,
+                "agent_name": state.agent_name,
+            }
+        ),
         encoding="utf-8",
     )
     os.replace(tmp, bridge_dir / _STATE_FILE)
@@ -173,39 +189,73 @@ def _warn_ambiguous_discovery(workspace: str, session_ids: list[str]) -> None:
     )
 
 
+def _kiro_metadata_agent_name(metadata: dict[str, object]) -> str | None:
+    """Return the ``session_state.agent_name`` a Kiro metadata file advertises.
+
+    ``agent_name`` is the kiro-cli agent profile name (see
+    ``kiro_agent_profile_name``) kiro-cli was launched with via ``--agent``;
+    kiro-cli stamps it into its own persisted ``session_state`` regardless of
+    whether Omnigent wrote that profile. ``None`` when the field is missing,
+    not a string, or the metadata predates kiro-cli tagging it at all --
+    callers must treat that the same as "unknown", not "no agent".
+    """
+    session_state = metadata.get("session_state")
+    if not isinstance(session_state, dict):
+        return None
+    agent_name = session_state.get("agent_name")
+    return agent_name if isinstance(agent_name, str) and agent_name else None
+
+
 def _discover_kiro_session_jsonl(
     *,
     workspace: str,
     launch_epoch_ms: int,
+    expected_agent_name: str | None = None,
     sessions_dir: Path | None = None,
 ) -> tuple[str, Path] | None:
-    """Find this Omnigent session's Kiro JSONL file — only when it's unambiguous.
+    """Find this Omnigent session's Kiro JSONL file -- only when it's unambiguous.
 
     Candidates are Kiro sessions in the same workspace (``cwd``) with a parseable
     ``created_at`` at/after the launch floor (``launch_epoch_ms`` minus a small
-    skew, which already drops pre-existing sessions). We bind **only when exactly
-    one** session qualifies.
+    skew, which already drops pre-existing sessions).
 
-    Each Kiro session is its own JSONL keyed by Kiro's minted id, so two fresh
-    sessions launched in the same workspace within the skew window both qualify.
-    Picking newest-by-``updated_at`` (the old behaviour) would latch onto
-    whichever session most recently emitted a turn — i.e. it can bind the *other*
-    session's transcript and silently cross-talk it into this conversation. With
-    two or more candidates we can't tell which JSONL is ours, so we return
-    ``None`` and retry rather than guess (logged once via
-    :func:`_warn_ambiguous_discovery` so the ambiguous case is distinct from "not
-    written yet"). A brief delay is safe; mirroring the wrong conversation is not.
-    Mirrors cursor-native's "bind only when exactly one chat qualifies"
+    When *expected_agent_name* is given (the session opted into a per-session
+    kiro-cli agent profile -- see ``ExecutorSpec.kiro_agent_profile``), it is
+    the primary disambiguator: we bind only the candidate whose own
+    ``session_state.agent_name`` equals it, since that name is unique per
+    Omnigent session (``kiro_agent_profile_name``, a digest of the session id).
+    This also protects against a *staggered* arrival that same-workspace-only
+    filtering can't: when N sessions launch concurrently in one workspace,
+    their Kiro CLI session files don't all appear at once, so a forwarder can
+    poll a moment when exactly one same-workspace candidate exists on disk --
+    and it may not be this session's own. Requiring the tagged name to match
+    means "the one candidate so far is someone else's" correctly stays
+    unresolved (``None``, retried next poll) instead of being treated as "the
+    only candidate, so it must be ours". Confirmed against a real incident:
+    five specialists launched concurrently in one workspace all had their
+    forwarder bind to whichever one happened to write its Kiro session file
+    first, silently mirroring that one session's transcript into all five
+    Omnigent conversations.
+
+    Without *expected_agent_name* (no per-session profile -- e.g. the default
+    kiro-native-ui session, or any candidate whose metadata predates kiro-cli
+    tagging ``agent_name`` at all), we fall back to the original workspace+time
+    heuristic: bind **only when exactly one** candidate qualifies. Two or more
+    same-workspace candidates within the skew window are indistinguishable
+    without a name to match, so we return ``None`` and retry rather than guess
+    (logged once via :func:`_warn_ambiguous_discovery`). A brief delay is safe;
+    mirroring the wrong conversation is not. Mirrors cursor-native's "bind only
+    when exactly one chat qualifies"
     (:func:`omnigent.harnesses.cursor_native.forwarder._discover_store`).
 
-    The resume/fork path doesn't reach here: when the Kiro id is already known the
-    caller binds it directly via :func:`_kiro_session_jsonl_for_id`.
+    The resume/fork path doesn't reach here: when the Kiro id is already known
+    the caller binds it directly via :func:`_kiro_session_jsonl_for_id`.
     """
     root = sessions_dir or kiro_cli_sessions_dir()
     if not root.is_dir():
         return None
     floor_ms = max(0, launch_epoch_ms - _DISCOVERY_SKEW_MS)
-    candidates: list[tuple[str, Path]] = []
+    candidates: list[tuple[str, Path, str | None]] = []
     for metadata_path in root.glob("*.json"):
         session_id = metadata_path.stem
         jsonl_path = root / f"{session_id}.jsonl"
@@ -224,11 +274,35 @@ def _discover_kiro_session_jsonl(
         # count and silently blocking discovery forever.
         if not created_ms or created_ms < floor_ms:
             continue
-        candidates.append((session_id, jsonl_path))
-    if len(candidates) > 1:
-        _warn_ambiguous_discovery(workspace, [session_id for session_id, _ in candidates])
+        candidates.append((session_id, jsonl_path, _kiro_metadata_agent_name(metadata)))
+
+    if expected_agent_name:
+        agent_matches = [
+            (session_id, jsonl_path)
+            for session_id, jsonl_path, agent_name in candidates
+            if agent_name == expected_agent_name
+        ]
+        if len(agent_matches) == 1:
+            return agent_matches[0]
+        if len(agent_matches) > 1:
+            # Shouldn't happen (the name is a digest of a single session id),
+            # but don't guess between them if it somehow does.
+            _warn_ambiguous_discovery(workspace, [session_id for session_id, _ in agent_matches])
+            return None
+        # No candidate advertises our name yet. If at least one candidate
+        # advertises *some* name, kiro-cli in this environment does tag
+        # agent_name, so an untagged/mismatched candidate must belong to a
+        # different session -- keep waiting for our own rather than falling
+        # back to "the only one so far" (that's exactly the staggered-arrival
+        # cross-talk this disambiguation exists to prevent).
+        if any(agent_name is not None for _, _, agent_name in candidates):
+            return None
+
+    plain_candidates = [(session_id, jsonl_path) for session_id, jsonl_path, _ in candidates]
+    if len(plain_candidates) > 1:
+        _warn_ambiguous_discovery(workspace, [session_id for session_id, _ in plain_candidates])
         return None
-    return candidates[0] if candidates else None
+    return plain_candidates[0] if plain_candidates else None
 
 
 def _kiro_session_jsonl_for_id(
@@ -736,10 +810,21 @@ async def forward_kiro_session_to_omnigent(
     workspace: str,
     launch_epoch_ms: int,
     expected_session_id: str | None = None,
+    expected_kiro_agent_name: str | None = None,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
 ) -> None:
-    """Tail Kiro's session JSONL and mirror assistant messages into AP."""
+    """Tail Kiro's session JSONL and mirror assistant messages into AP.
+
+    :param expected_kiro_agent_name: The kiro-cli ``--agent`` profile name
+        (``kiro_agent_profile_name(session_id)``) this session was launched
+        with, when it opted into a per-session profile. Passed to
+        :func:`_discover_kiro_session_jsonl` to disambiguate discovery by the
+        Kiro session's own tagged ``session_state.agent_name`` instead of
+        workspace+time alone. ``None`` for sessions without a per-session
+        profile (e.g. the default kiro-native-ui session), which keeps the
+        original workspace+time-only heuristic.
+    """
     state = _read_state(bridge_dir)
     jsonl_path: Path | None = None
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
@@ -778,11 +863,16 @@ async def forward_kiro_session_to_omnigent(
                             _discover_kiro_session_jsonl,
                             workspace=workspace,
                             launch_epoch_ms=launch_epoch_ms,
+                            expected_agent_name=expected_kiro_agent_name,
                         )
                     if discovered is not None:
                         discovered_session_id, discovered_path = discovered
                         if state.session_id != discovered_session_id:
-                            state = _ForwardState(session_id=discovered_session_id, byte_offset=0)
+                            state = _ForwardState(
+                                session_id=discovered_session_id,
+                                byte_offset=0,
+                                agent_name=expected_kiro_agent_name,
+                            )
                             _write_state(bridge_dir, state)
                         jsonl_path = discovered_path
                 if jsonl_path is not None and state.session_id is not None:
@@ -919,10 +1009,15 @@ async def supervise_kiro_session_forwarder(
     workspace: str,
     launch_epoch_ms: int,
     expected_session_id: str | None = None,
+    expected_kiro_agent_name: str | None = None,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
 ) -> None:
-    """Run the Kiro session forwarder under a restart supervisor."""
+    """Run the Kiro session forwarder under a restart supervisor.
+
+    :param expected_kiro_agent_name: See
+        :func:`forward_kiro_session_to_omnigent`.
+    """
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
     while True:
         run_started_at = _supervisor_monotonic()
@@ -937,6 +1032,7 @@ async def supervise_kiro_session_forwarder(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 expected_session_id=expected_session_id,
+                expected_kiro_agent_name=expected_kiro_agent_name,
                 poll_interval_s=poll_interval_s,
                 auth=auth,
             )

@@ -23,12 +23,15 @@ def _write_kiro_session(
     lines: list[dict[str, Any]] | None = None,
     user_turn_metadatas: list[dict[str, Any]] | None = None,
     model_id: str | None = None,
+    agent_name: str | None = None,
 ) -> Path:
     """Create a minimal Kiro CLI session metadata + JSONL fixture.
 
     Pass ``user_turn_metadatas`` / ``model_id`` to populate the credit-metering
     fields the ``.json`` snapshot carries (``session_state.conversation_metadata
     .user_turn_metadatas`` and ``session_state.rts_model_state.model_info``).
+    Pass ``agent_name`` to stamp ``session_state.agent_name`` -- the kiro-cli
+    ``--agent`` profile name discovery matches against.
     """
     root.mkdir(parents=True, exist_ok=True)
     metadata: dict[str, Any] = {
@@ -38,12 +41,14 @@ def _write_kiro_session(
         "updated_at": updated_at,
         "title": "hello",
     }
-    if user_turn_metadatas is not None or model_id is not None:
+    if user_turn_metadatas is not None or model_id is not None or agent_name is not None:
         session_state: dict[str, Any] = {}
         if user_turn_metadatas is not None:
             session_state["conversation_metadata"] = {"user_turn_metadatas": user_turn_metadatas}
         if model_id is not None:
             session_state["rts_model_state"] = {"model_info": {"model_id": model_id}}
+        if agent_name is not None:
+            session_state["agent_name"] = agent_name
         metadata["session_state"] = session_state
     (root / f"{session_id}.json").write_text(json.dumps(metadata), encoding="utf-8")
     jsonl_path = root / f"{session_id}.jsonl"
@@ -171,6 +176,144 @@ def test_discover_kiro_session_jsonl_skips_session_with_unparseable_created_at(
     )
 
     assert discovered == ("current", expected)
+
+
+def test_discover_kiro_session_jsonl_agent_name_beats_stale_single_candidate(
+    tmp_path: Path,
+) -> None:
+    """A staggered arrival must not bind to someone else's lone candidate.
+
+    Regression for the 2026-09-12 incident: N kiro-native sessions launch
+    concurrently in one workspace, and their Kiro CLI session files don't all
+    appear on disk at once. A forwarder that polls while only one (someone
+    else's) same-workspace candidate exists must not treat "exactly one
+    candidate" as "must be ours" when it has its own tagged agent name to
+    match against and that candidate doesn't carry it.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="other-specialist",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:39:36Z",
+        agent_name="omnigent-other-specialist",
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        expected_agent_name="omnigent-this-specialist",
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered is None
+
+
+def test_discover_kiro_session_jsonl_agent_name_matches_despite_other_candidates(
+    tmp_path: Path,
+) -> None:
+    """Once this session's own tagged file exists, bind it -- others don't block.
+
+    Two same-workspace, in-window candidates would be ambiguous under the old
+    workspace+time-only rule (len(candidates) > 1 -> None forever). With a
+    known agent name to match, the presence of an unrelated candidate is no
+    longer disqualifying.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="other-specialist",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:39:36Z",
+        agent_name="omnigent-other-specialist",
+    )
+    expected = _write_kiro_session(
+        sessions_dir,
+        session_id="this-specialist",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:37Z",
+        updated_at="2026-06-21T01:39:38Z",
+        agent_name="omnigent-this-specialist",
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        expected_agent_name="omnigent-this-specialist",
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered == ("this-specialist", expected)
+
+
+def test_discover_kiro_session_jsonl_agent_name_ambiguous_duplicate_returns_none(
+    tmp_path: Path,
+) -> None:
+    """Two candidates tagged with the same expected agent name still refuse to guess."""
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="dup-a",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:39:36Z",
+        agent_name="omnigent-this-specialist",
+    )
+    _write_kiro_session(
+        sessions_dir,
+        session_id="dup-b",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:37Z",
+        updated_at="2026-06-21T01:39:38Z",
+        agent_name="omnigent-this-specialist",
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        expected_agent_name="omnigent-this-specialist",
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered is None
+
+
+def test_discover_kiro_session_jsonl_agent_name_falls_back_when_untagged(
+    tmp_path: Path,
+) -> None:
+    """An expected agent name is harmless when no candidate tags one at all.
+
+    Older kiro-cli metadata (or any environment that never stamps
+    ``session_state.agent_name``) must keep working exactly as before:
+    fall back to the workspace+time-only "exactly one candidate" rule.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    expected = _write_kiro_session(
+        sessions_dir,
+        session_id="untagged",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:39:36Z",
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        expected_agent_name="omnigent-this-specialist",
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered == ("untagged", expected)
 
 
 def test_read_new_kiro_messages_returns_user_and_assistant_text(tmp_path: Path) -> None:
@@ -1243,6 +1386,139 @@ async def test_forward_kiro_session_waits_for_expected_resume_session(
 
     assert posted == []
     assert external_ids == []
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_disambiguates_staggered_concurrent_launches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the 2026-09-12 incident: 5 concurrent kiro-native
+    specialists sharing one workspace all had their forwarder bind to
+    whichever one happened to write its Kiro CLI session file first
+    (``azure-specialist``, per the real incident), silently mirroring that
+    one session's transcript into every other conversation.
+
+    This reproduces the staggered arrival directly: this session's own Kiro
+    session file does not exist yet when the forwarder starts polling, and a
+    same-workspace sibling's file (tagged with a *different* agent name)
+    already does. The forwarder must not bind to the sibling's file just
+    because it is the only candidate so far; it must keep waiting until its
+    own tagged file appears, then bind and mirror only that.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "cogna"
+    workspace.mkdir(parents=True)
+    launch_epoch_ms = forwarder._parse_iso_epoch_ms("2026-09-12T12:48:47Z")
+
+    # azure-specialist's Kiro session file lands first, as it did in the real
+    # incident -- well within the discovery skew window of every other
+    # specialist's launch floor.
+    _write_kiro_session(
+        sessions_dir,
+        session_id="azure-kiro-id",
+        cwd=workspace,
+        created_at="2026-09-12T12:48:47.656Z",
+        updated_at="2026-09-12T12:48:49Z",
+        agent_name="omnigent-azure-agent",
+        lines=[
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "azure-assistant",
+                    "content": [{"kind": "text", "data": "Sou o azure-specialist"}],
+                },
+            }
+        ],
+    )
+
+    bridge_dir = tmp_path / "bridge-terraform"
+    posted: list[forwarder._KiroConversationMessage] = []
+    external_ids: list[str] = []
+
+    async def _fake_post(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        agent_name: str,
+        message: forwarder._KiroConversationMessage,
+    ) -> None:
+        del client, session_id, agent_name
+        posted.append(message)
+
+    async def _fake_patch_external_session_id(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        external_session_id: str,
+    ) -> None:
+        del client, session_id
+        external_ids.append(external_session_id)
+
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
+    monkeypatch.setattr(
+        forwarder,
+        "_patch_external_session_id",
+        _fake_patch_external_session_id,
+    )
+
+    poll_count = 0
+
+    async def _fake_sleep(_seconds: float) -> None:
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            # terraform-ops's own Kiro session file appears late -- ~8s after
+            # azure's, per the real incident's timestamps, but still inside
+            # the 10s discovery skew window.
+            _write_kiro_session(
+                sessions_dir,
+                session_id="terraform-kiro-id",
+                cwd=workspace,
+                created_at="2026-09-12T12:48:55.812Z",
+                updated_at="2026-09-12T12:48:56Z",
+                agent_name="omnigent-terraform-agent",
+                lines=[
+                    {
+                        "version": "v1",
+                        "kind": "AssistantMessage",
+                        "data": {
+                            "message_id": "terraform-assistant",
+                            "content": [{"kind": "text", "data": "Sou o terraform-ops"}],
+                        },
+                    }
+                ],
+            )
+            return
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_terraform",
+            bridge_dir=bridge_dir,
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=launch_epoch_ms,
+            expected_kiro_agent_name="omnigent-terraform-agent",
+        )
+
+    # Never mirrored azure's transcript; bound and mirrored its own once its
+    # own tagged Kiro session file existed.
+    assert posted == [
+        forwarder._KiroConversationMessage(
+            message_id="terraform-assistant", role="assistant", text="Sou o terraform-ops"
+        ),
+    ]
+    assert external_ids == ["terraform-kiro-id"]
+    state = json.loads((bridge_dir / "kiro_session_forwarder.json").read_text())
+    assert state["session_id"] == "terraform-kiro-id"
+    assert state["agent_name"] == "omnigent-terraform-agent"
 
 
 @pytest.mark.asyncio
