@@ -248,8 +248,12 @@ def _discover_kiro_session_jsonl(
     when exactly one chat qualifies"
     (:func:`omnigent.harnesses.cursor_native.forwarder._discover_store`).
 
-    The resume/fork path doesn't reach here: when the Kiro id is already known
-    the caller binds it directly via :func:`_kiro_session_jsonl_for_id`.
+    A resume/fork with a per-session agent profile can also reach here now:
+    when the caller's known Kiro id (``expected_session_id``) is rejected by
+    :func:`_kiro_session_jsonl_for_id`'s own agent_name check, the forwarder
+    falls back to this discovery instead of polling a confirmed-wrong id
+    forever. A resume without a per-session profile still binds directly via
+    :func:`_kiro_session_jsonl_for_id` alone and never reaches here.
     """
     root = sessions_dir or kiro_cli_sessions_dir()
     if not root.is_dir():
@@ -309,9 +313,27 @@ def _kiro_session_jsonl_for_id(
     session_id: str,
     *,
     workspace: str,
+    expected_agent_name: str | None = None,
     sessions_dir: Path | None = None,
 ) -> Path | None:
-    """Return the JSONL path for a known Kiro session id, if it is usable."""
+    """Return the JSONL path for a known Kiro session id, if it is usable.
+
+    :param expected_agent_name: When given, additionally reject *session_id*
+        if its own recorded ``session_state.agent_name`` is present and
+        differs from it. The caller's ``expected_session_id`` (this
+        function's *session_id*) is read once at launch from this Omnigent
+        session's own server row and is normally trustworthy, but nothing
+        upstream of this call guarantees it can never point at a different
+        session -- confirmed against a 2026-09-13 incident where five
+        kiro-native specialists launched concurrently in one shared
+        workspace all converged on the single oldest sibling's Kiro session:
+        unlike :func:`_discover_kiro_session_jsonl`, this path had no
+        independent check before trusting an already-known id outright, so
+        it silently accepted it. Metadata that predates kiro-cli tagging
+        ``agent_name`` at all (``None``) can't be disproved, so it is still
+        accepted -- the same permissive default discovery's fallback branch
+        uses.
+    """
     root = sessions_dir or kiro_cli_sessions_dir()
     metadata_path = root / f"{session_id}.json"
     jsonl_path = root / f"{session_id}.jsonl"
@@ -323,6 +345,10 @@ def _kiro_session_jsonl_for_id(
         return None
     if not isinstance(metadata, dict) or not _same_workspace(metadata.get("cwd"), workspace):
         return None
+    if expected_agent_name is not None:
+        recorded_agent_name = _kiro_metadata_agent_name(metadata)
+        if recorded_agent_name is not None and recorded_agent_name != expected_agent_name:
+            return None
     return jsonl_path
 
 
@@ -818,12 +844,16 @@ async def forward_kiro_session_to_omnigent(
 
     :param expected_kiro_agent_name: The kiro-cli ``--agent`` profile name
         (``kiro_agent_profile_name(session_id)``) this session was launched
-        with, when it opted into a per-session profile. Passed to
-        :func:`_discover_kiro_session_jsonl` to disambiguate discovery by the
+        with, when it opted into a per-session profile. Passed to both
+        :func:`_kiro_session_jsonl_for_id` (to reject an ``expected_session_id``
+        that turns out to belong to a different agent) and
+        :func:`_discover_kiro_session_jsonl` (to disambiguate discovery by the
         Kiro session's own tagged ``session_state.agent_name`` instead of
-        workspace+time alone. ``None`` for sessions without a per-session
-        profile (e.g. the default kiro-native-ui session), which keeps the
-        original workspace+time-only heuristic.
+        workspace+time alone, including as the fallback when the former
+        rejects ``expected_session_id``). ``None`` for sessions without a
+        per-session profile (e.g. the default kiro-native-ui session), which
+        keeps the original behavior: ``expected_session_id`` is trusted as-is,
+        and discovery falls back to the workspace+time-only heuristic.
     """
     state = _read_state(bridge_dir)
     jsonl_path: Path | None = None
@@ -855,10 +885,26 @@ async def forward_kiro_session_to_omnigent(
                             _kiro_session_jsonl_for_id,
                             expected_session_id,
                             workspace=workspace,
+                            expected_agent_name=expected_kiro_agent_name,
                         )
                         if expected_path is not None:
                             discovered = (expected_session_id, expected_path)
-                    elif discovered is None:
+                        elif expected_kiro_agent_name is not None:
+                            # expected_session_id was rejected (workspace or
+                            # agent_name mismatch) but this session has a
+                            # per-session agent profile to disambiguate by --
+                            # fall back to discovery instead of polling a
+                            # confirmed-wrong id forever. Without a name to
+                            # check, there is no way to tell "wrong" from
+                            # "not written yet", so a plain resume keeps
+                            # waiting on expected_session_id alone, as before.
+                            discovered = await asyncio.to_thread(
+                                _discover_kiro_session_jsonl,
+                                workspace=workspace,
+                                launch_epoch_ms=launch_epoch_ms,
+                                expected_agent_name=expected_kiro_agent_name,
+                            )
+                    else:
                         discovered = await asyncio.to_thread(
                             _discover_kiro_session_jsonl,
                             workspace=workspace,

@@ -316,6 +316,85 @@ def test_discover_kiro_session_jsonl_agent_name_falls_back_when_untagged(
     assert discovered == ("untagged", expected)
 
 
+def test_kiro_session_jsonl_for_id_rejects_mismatched_agent_name(tmp_path: Path) -> None:
+    """``expected_session_id`` is not trusted blindly when it names another agent.
+
+    Regression for the 2026-09-13 incident: a launch-time snapshot of
+    ``external_session_id`` (``expected_session_id`` here) ended up carrying a
+    concurrent sibling specialist's Kiro session id in the same workspace.
+    Unlike :func:`forwarder._discover_kiro_session_jsonl`, this lookup used to
+    accept any same-workspace id at face value with no agent_name check --
+    silently binding a specialist's forwarder to a sibling's transcript.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="sibling-kiro-id",
+        cwd=workspace,
+        agent_name="omnigent-azure-agent",
+    )
+
+    resolved = forwarder._kiro_session_jsonl_for_id(
+        "sibling-kiro-id",
+        workspace=str(workspace),
+        expected_agent_name="omnigent-terraform-agent",
+        sessions_dir=sessions_dir,
+    )
+
+    assert resolved is None
+
+
+def test_kiro_session_jsonl_for_id_accepts_matching_agent_name(tmp_path: Path) -> None:
+    """The known-id path still binds normally when the agent name matches."""
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    expected = _write_kiro_session(
+        sessions_dir,
+        session_id="own-kiro-id",
+        cwd=workspace,
+        agent_name="omnigent-terraform-agent",
+    )
+
+    resolved = forwarder._kiro_session_jsonl_for_id(
+        "own-kiro-id",
+        workspace=str(workspace),
+        expected_agent_name="omnigent-terraform-agent",
+        sessions_dir=sessions_dir,
+    )
+
+    assert resolved == expected
+
+
+def test_kiro_session_jsonl_for_id_accepts_untagged_metadata(tmp_path: Path) -> None:
+    """An expected agent name is harmless against metadata that tags none.
+
+    Mirrors discovery's own permissive fallback
+    (``test_discover_kiro_session_jsonl_agent_name_falls_back_when_untagged``):
+    metadata predating kiro-cli's ``agent_name`` tagging can't be disproved,
+    so it is still accepted.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    expected = _write_kiro_session(
+        sessions_dir,
+        session_id="untagged-kiro-id",
+        cwd=workspace,
+    )
+
+    resolved = forwarder._kiro_session_jsonl_for_id(
+        "untagged-kiro-id",
+        workspace=str(workspace),
+        expected_agent_name="omnigent-terraform-agent",
+        sessions_dir=sessions_dir,
+    )
+
+    assert resolved == expected
+
+
 def test_read_new_kiro_messages_returns_user_and_assistant_text(tmp_path: Path) -> None:
     """The JSONL reader mirrors Kiro prompt and assistant message text."""
     jsonl_path = tmp_path / "session.jsonl"
