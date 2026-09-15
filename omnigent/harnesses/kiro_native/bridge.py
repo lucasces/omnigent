@@ -39,6 +39,28 @@ _FORWARDER_READY_FILE = "kiro_session_forwarder_ready.json"
 _ACP_RECORD_FILE = "kiro_acp_record.jsonl"
 # Shared Omnigent MCP relay (serve-mcp) registration for kiro.
 _MCP_SERVER_NAME = "omnigent"
+# Subagent orchestration/read tools pre-authorized in every kiro-cli agent
+# profile (see ``write_kiro_agent_profile``). Confirmed end-to-end against a
+# live kiro-cli 2.20.1 binary: populating an agent profile's ``allowedTools``
+# with ``@<mcpServerName>/<toolName>`` entries makes kiro-cli run that MCP
+# tool call immediately (``tool_call_update`` status ``completed``) instead of
+# surfacing its approval elicitation ("Running: @omnigent/<tool>", mirrored to
+# the web as an approval card). Deliberately excludes shell/filesystem tools
+# (``sys_os_shell``, ``sys_os_write``, ``sys_os_edit``, ...) -- those keep
+# requiring approval since they carry real blast radius.
+_SUBAGENT_MANAGEMENT_TOOLS = (
+    "sys_agent_list",
+    "sys_agent_get",
+    "sys_session_create",
+    "sys_session_send",
+    "sys_session_get_info",
+    "sys_session_get_history",
+    "sys_session_list",
+    "sys_read_inbox",
+    "sys_call_async",
+    "sys_cancel_task",
+    "sys_cancel_async",
+)
 _MCP_BRIDGE_CONFIG_FILE = "bridge.json"
 # kiro reads workspace-scoped MCP servers from ``<workspace>/.kiro/settings/mcp.json``
 # (confirmed against kiro-cli 2.10.0). Mirrors cursor-native's ``.cursor/mcp.json``.
@@ -321,7 +343,10 @@ def write_kiro_agent_profile(
     (tmp + os.replace), mirroring ``write_kiro_workspace_mcp_config``.
     Sweeps orphaned profiles from prior crashed sessions in this
     workspace first (best-effort; see
-    ``sweep_orphaned_kiro_agent_profiles``).
+    ``sweep_orphaned_kiro_agent_profiles``). Pre-authorizes
+    ``_SUBAGENT_MANAGEMENT_TOOLS`` via ``allowedTools`` so orchestration/read
+    calls run without kiro-cli's per-call approval elicitation; shell and
+    filesystem tools are deliberately left out and still require approval.
 
     :param workspace: The kiro-cli workspace root.
     :param session_id: Session/conversation id; keys the unique filename.
@@ -341,7 +366,7 @@ def write_kiro_agent_profile(
         "mcpServers": {},
         "tools": ["*"],
         "toolAliases": {},
-        "allowedTools": [],
+        "allowedTools": [f"@{_MCP_SERVER_NAME}/{tool}" for tool in _SUBAGENT_MANAGEMENT_TOOLS],
         "resources": [],
         "toolsSettings": {},
         "includeMcpJson": True,

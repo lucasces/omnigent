@@ -1414,7 +1414,9 @@ def test_write_kiro_agent_profile_writes_expected_schema(tmp_path: Path) -> None
         "mcpServers": {},
         "tools": ["*"],
         "toolAliases": {},
-        "allowedTools": [],
+        "allowedTools": [
+            f"@{bridge._MCP_SERVER_NAME}/{tool}" for tool in bridge._SUBAGENT_MANAGEMENT_TOOLS
+        ],
         "resources": [],
         "toolsSettings": {},
         "includeMcpJson": True,
@@ -1435,6 +1437,50 @@ def test_write_kiro_agent_profile_defaults_description_to_empty_string(
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["description"] == ""
     assert payload["name"] == kiro_agent_profile_name("conv_abc")
+
+
+def test_write_kiro_agent_profile_preauthorizes_subagent_management_tools(
+    tmp_path: Path,
+) -> None:
+    """
+    ``allowedTools`` pre-authorizes subagent orchestration/read MCP calls.
+
+    Confirmed end-to-end against a live kiro-cli 2.20.1 binary (manual
+    ``kiro-cli chat --tui --agent-engine v2`` run against a fake
+    ``@omnigent`` MCP server): an agent profile with a tool name in
+    ``allowedTools`` (format ``@<mcpServerName>/<toolName>``) runs that
+    call immediately instead of surfacing kiro-cli's per-call approval
+    elicitation, which is exactly the fadiga-de-aprovacao this default
+    exists to avoid for sys_agent_list/sys_session_create/etc. Shell and
+    filesystem tools are deliberately left out of the default -- they
+    keep requiring approval since they carry real blast radius.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    path = write_kiro_agent_profile(workspace, "conv_abc", prompt="You are helpful.")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    allowed = set(payload["allowedTools"])
+    assert allowed == {
+        f"@{bridge._MCP_SERVER_NAME}/{tool}" for tool in bridge._SUBAGENT_MANAGEMENT_TOOLS
+    }
+    for orchestration_tool in (
+        "sys_agent_list",
+        "sys_agent_get",
+        "sys_session_create",
+        "sys_session_send",
+        "sys_session_get_info",
+        "sys_session_get_history",
+        "sys_session_list",
+        "sys_read_inbox",
+        "sys_call_async",
+        "sys_cancel_task",
+        "sys_cancel_async",
+    ):
+        assert f"@omnigent/{orchestration_tool}" in allowed
+    for blast_radius_tool in ("sys_os_shell", "sys_os_write", "sys_os_edit", "sys_os_read"):
+        assert f"@omnigent/{blast_radius_tool}" not in allowed
 
 
 @pytest.mark.skipif(shutil.which("kiro-cli") is None, reason="kiro-cli binary not on PATH")
