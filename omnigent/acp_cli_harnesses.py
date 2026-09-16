@@ -59,12 +59,19 @@ class AcpCliHarness:
         MCP and ignore ``mcpServers``, configuring MCP out of band instead
         (e.g. jcode reads ``~/.jcode/mcp.json``); set ``False`` for those so
         the server isn't advertised.
+    :param session_agent_profile: Write a per-session kiro-cli agent profile to
+        ``<cwd>/.kiro/agents/<name>.json`` and select it with ``--agent <name>``
+        (see :func:`omnigent.runtime.workflow._build_acp_cli_spawn_env`). The
+        profile carries the agent's ``instructions`` as its persona plus the
+        pre-authorized ``allowedTools``, which is the only channel kiro-cli
+        reads them from. Off for every other row.
     """
 
     install: HarnessInstallSpec
     args: tuple[str, ...]
     aliases: tuple[str, ...] = ()
     omnigent_mcp: bool = True
+    session_agent_profile: bool = False
 
     @property
     def label(self) -> str:
@@ -120,6 +127,33 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         ),
         args=("agent", "stdio"),
         aliases=("grok-build",),
+    ),
+    # Kiro (AWS's ``kiro-cli``) drives ``kiro-cli acp`` -- its headless ACP
+    # stdio server, the same binary the ``kiro-native`` TUI harness drives.
+    # Additive: ``kiro-native`` keeps working untouched, and an agent opts into
+    # this path by declaring ``harness: kiro-acp``.
+    #
+    # Two divergences from a plain row, both verified against a live kiro-cli
+    # 2.20.1 ACP session:
+    #  * ``session_agent_profile`` -- kiro takes its persona, its MCP servers
+    #    and its pre-authorized ``allowedTools`` from the ``--agent`` profile.
+    #  * ``omnigent_mcp=False`` -- kiro IGNORES ``session/new.mcpServers``
+    #    entirely (a server declared there never initializes), so advertising
+    #    the relay there would only start a relay nothing connects to. Wiring
+    #    Omnigent's MCP tools into the profile instead is a follow-up; until
+    #    then a ``kiro-acp`` agent has kiro's own tools but not Omnigent's
+    #    builtins (no ``sys_session_*`` orchestration).
+    "kiro-acp": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Kiro (ACP)",
+            "kiro-cli",
+            None,
+            install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
+            auth_hint="sign in with `kiro-cli login` (Omnigent stores no Kiro credential)",
+        ),
+        args=("acp",),
+        omnigent_mcp=False,
+        session_agent_profile=True,
     ),
     # jcode (https://jcode.sh) drives ``jcode acp``. Ships via a curl
     # installer (not npm) and owns its provider/model config in

@@ -285,3 +285,114 @@ def test_spawn_env_forwards_permission_mode(monkeypatch: pytest.MonkeyPatch) -> 
     assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_cli_spawn_env(
         _spec("fakecli"), harness="fakecli"
     )
+
+
+# ---------------------------------------------------------------------------
+# kiro-acp: the one row that carries a per-session agent profile
+# ---------------------------------------------------------------------------
+
+
+def _kiro_spec(instructions: str) -> AgentSpec:
+    return AgentSpec(
+        spec_version=1,
+        name="kiro-acp-test",
+        instructions=instructions,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-acp"}),
+    )
+
+
+def test_kiro_acp_row_writes_a_profile_and_selects_it(tmp_path: Path) -> None:
+    """The persona reaches kiro through ``--agent``, not the first user turn.
+
+    kiro-cli takes its persona, MCP servers and pre-authorized ``allowedTools``
+    from the ``--agent`` profile; verified against a live kiro-cli 2.20.1 ACP
+    session, where a profile-backed agent answered as its profile persona while
+    the injected system prompt did not reach it.
+    """
+    env = _build_acp_cli_spawn_env(
+        _kiro_spec("You are a spike specialist."),
+        harness="kiro-acp",
+        cwd=tmp_path,
+        session_id="sess-1",
+    )
+    argv = shlex.split(env["HARNESS_ACP_COMMAND"])
+    assert argv[1] == "acp"
+    assert "--agent" in argv
+
+    profile_name = argv[argv.index("--agent") + 1]
+    profile = tmp_path / ".kiro" / "agents" / f"{profile_name}.json"
+    assert profile.is_file()
+    payload = json.loads(profile.read_text())
+    assert payload["name"] == profile_name
+    assert payload["prompt"] == "You are a spike specialist."
+    # Orchestration/read tools stay pre-authorized so they don't raise a card.
+    assert "@omnigent/sys_session_create" in payload["allowedTools"]
+
+    # The persona is delivered once, by the profile.
+    assert env["HARNESS_ACP_INJECT_SYSTEM_PROMPT"] == "0"
+    # kiro ignores session/new.mcpServers, so the relay is not advertised there.
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+
+def test_kiro_acp_profile_name_is_stable_per_session(tmp_path: Path) -> None:
+    """Two sessions in one workspace get their own file and never collide."""
+    one = _build_acp_cli_spawn_env(
+        _kiro_spec("A"), harness="kiro-acp", cwd=tmp_path, session_id="sess-a"
+    )
+    two = _build_acp_cli_spawn_env(
+        _kiro_spec("B"), harness="kiro-acp", cwd=tmp_path, session_id="sess-b"
+    )
+    assert one["HARNESS_ACP_COMMAND"] != two["HARNESS_ACP_COMMAND"]
+    assert len(list((tmp_path / ".kiro" / "agents").glob("*.json"))) == 2
+
+    # Deterministic from the session id alone, so teardown can re-derive it.
+    again = _build_acp_cli_spawn_env(
+        _kiro_spec("A"), harness="kiro-acp", cwd=tmp_path, session_id="sess-a"
+    )
+    assert again["HARNESS_ACP_COMMAND"] == one["HARNESS_ACP_COMMAND"]
+
+
+def test_kiro_acp_without_instructions_uses_kiros_default_agent(tmp_path: Path) -> None:
+    """Nothing to say, nothing to write -- and no dangling ``--agent``."""
+    env = _build_acp_cli_spawn_env(
+        _kiro_spec(""), harness="kiro-acp", cwd=tmp_path, session_id="sess-bare"
+    )
+    assert "--agent" not in env["HARNESS_ACP_COMMAND"]
+    assert not (tmp_path / ".kiro" / "agents").exists()
+    assert "HARNESS_ACP_INJECT_SYSTEM_PROMPT" not in env
+
+
+def test_kiro_acp_without_a_session_id_writes_nothing(tmp_path: Path) -> None:
+    """The profile name is keyed by session id; no id means no profile."""
+    env = _build_acp_cli_spawn_env(
+        _kiro_spec("You are a spike specialist."), harness="kiro-acp", cwd=tmp_path
+    )
+    assert "--agent" not in env["HARNESS_ACP_COMMAND"]
+    assert not (tmp_path / ".kiro" / "agents").exists()
+
+
+def test_kiro_acp_profile_is_registered_for_teardown(tmp_path: Path) -> None:
+    """Teardown removes the file, so it can't linger in the user's workspace."""
+    from omnigent.runner.native.orchestration import _KIRO_AGENT_PROFILE_FILES
+
+    _build_acp_cli_spawn_env(
+        _kiro_spec("You are a spike specialist."),
+        harness="kiro-acp",
+        cwd=tmp_path,
+        session_id="sess-teardown",
+    )
+    try:
+        path = _KIRO_AGENT_PROFILE_FILES.get("sess-teardown")
+        assert path is not None and path.is_file()
+    finally:
+        _KIRO_AGENT_PROFILE_FILES.pop("sess-teardown", None)
+
+
+@pytest.mark.parametrize("harness", sorted(set(ACP_CLI_HARNESSES) - {"kiro-acp"}))
+def test_other_rows_get_no_agent_profile(harness: str, tmp_path: Path) -> None:
+    """Only the kiro row opts in; every other row is byte-identical to before."""
+    env = _build_acp_cli_spawn_env(
+        _spec(harness), harness=harness, cwd=tmp_path, session_id="sess-x"
+    )
+    assert "--agent" not in env["HARNESS_ACP_COMMAND"]
+    assert not (tmp_path / ".kiro").exists()

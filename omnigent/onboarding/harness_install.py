@@ -345,6 +345,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
     "native-kiro": KIRO_KEY,
+    # The ACP row drives the same ``kiro-cli`` binary, so it shares the gate.
+    "kiro-acp": KIRO_KEY,
     # The native agy TUI bridge wraps the ``agy`` CLI. The in-process
     # ``antigravity`` SDK harness is deliberately absent because it needs no
     # CLI binary.

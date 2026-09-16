@@ -605,6 +605,12 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         **Defaults to ``False``.** No-op for every harness other than
         kiro-native, and a no-op for kiro-native itself when
         ``instructions`` is empty or unset.
+
+        Not needed by the ``kiro-acp`` harness: there the profile is not an
+        opt-in but the mechanism itself (kiro-cli reads its persona and its
+        pre-authorized ``allowedTools`` only from the ``--agent`` profile), so
+        that row always writes one when ``instructions`` are non-empty. Opting
+        into the ACP path is done by choosing the harness, not this flag.
     """
 
     type: str = "omnigent"
