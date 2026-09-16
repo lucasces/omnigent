@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shlex
 import sys
@@ -1866,6 +1867,138 @@ async def test_end_to_end_denied_permission(tmp_path: Path) -> None:
 
     # Turn still completes even though the tool was rejected.
     assert any(isinstance(e, TurnComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent permission requests (kiro-cli fans out; see the ACP migration doc)
+# ---------------------------------------------------------------------------
+
+#: A fake agent that fires THREE permission requests in the same breath, in an
+#: order that does not match the tools' names -- captured behaviour from a live
+#: kiro-cli 2.20.1 session, which emitted three requests within the same
+#: millisecond as "THREE, ONE, TWO". It answers the prompt only once all three
+#: have been responded to, and reports which optionId each id received.
+_FAKE_FANOUT_ACP_AGENT = """
+import json, sys
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\\n")
+    sys.stdout.flush()
+
+REQS = [("r-three", "tool_three"), ("r-one", "tool_one"), ("r-two", "tool_two")]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"],
+              "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "s1"}})
+    elif method == "session/prompt":
+        prompt_id = msg["id"]
+        for rid, tool in REQS:
+            send({"jsonrpc": "2.0", "id": rid, "method": "session/request_permission",
+                  "params": {"sessionId": "s1",
+                             "toolCall": {"toolCallId": tool, "title": tool, "rawInput": {}},
+                             "options": [
+                                 {"optionId": "allow_once", "name": "Yes", "kind": "allow_once"},
+                                 {"optionId": "allow_always", "name": "Always",
+                                  "kind": "allow_always"},
+                                 {"optionId": "reject_once", "name": "No",
+                                  "kind": "reject_once"}]}})
+        outcomes = {}
+        while len(outcomes) < len(REQS):
+            reply = json.loads(sys.stdin.readline())
+            rid = reply.get("id")
+            opt = (reply.get("result", {}).get("outcome", {}) or {}).get("optionId")
+            outcomes[rid] = opt
+        summary = "MAP:" + ",".join(f"{k}={outcomes[k]}" for k in sorted(outcomes))
+        send({"jsonrpc": "2.0", "method": "session/update",
+              "params": {"sessionId": "s1",
+                         "update": {"sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": summary}}}})
+        send({"jsonrpc": "2.0", "id": prompt_id, "result": {"stopReason": "end_turn"}})
+"""
+
+
+@pytest.mark.asyncio
+async def test_concurrent_permission_requests_are_not_serialized(tmp_path: Path) -> None:
+    """Three simultaneous requests must produce three simultaneously-open cards.
+
+    Regression for the head-of-line block: ``run_turn`` used to ``await`` each
+    server request inline, so card #2 was not created until card #1 had been
+    answered by a human. This handler refuses to answer until all three cards
+    are open, which simply deadlocks (and times out) under the old behaviour.
+    """
+    agent_path = tmp_path / "fanout_agent.py"
+    agent_path.write_text(_FAKE_FANOUT_ACP_AGENT)
+    ex = AcpExecutor(AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)])))
+
+    all_open = asyncio.Event()
+    open_names: list[str] = []
+
+    async def choice_handler(tool_name: str, tool_input: dict, options: list[str]) -> str:
+        open_names.append(tool_name)
+        if len(open_names) == 3:
+            all_open.set()
+        # Under the old inline-await behaviour this never fires: nothing else is
+        # read from the stream while this coroutine is parked.
+        await asyncio.wait_for(all_open.wait(), timeout=15)
+        return "Yes" if tool_name == "tool_two" else "No"
+
+    ex._elicitation_choice_handler = choice_handler  # type: ignore[assignment]
+
+    texts: list[str] = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "go"}], [], ""):
+            if isinstance(ev, TextChunk):
+                texts.append(ev.text)
+    finally:
+        await ex.close()
+
+    assert len(open_names) == 3, f"expected 3 concurrently-open cards, saw {open_names}"
+    assert sorted(open_names) == ["tool_one", "tool_three", "tool_two"]
+    # Each answer must land on its OWN request id, even though the requests
+    # arrived out of order and were answered concurrently.
+    combined = "".join(texts)
+    assert "r-one=reject_once" in combined, combined
+    assert "r-two=allow_once" in combined, combined
+    assert "r-three=reject_once" in combined, combined
+
+
+@pytest.mark.asyncio
+async def test_request_handlers_are_cancelled_on_close(tmp_path: Path) -> None:
+    """A card still parked when the session goes away must not linger."""
+    agent_path = tmp_path / "fanout_agent.py"
+    agent_path.write_text(_FAKE_FANOUT_ACP_AGENT)
+    ex = AcpExecutor(AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)])))
+
+    parked = asyncio.Event()
+
+    async def never_answers(tool_name: str, tool_input: dict, options: list[str]) -> str:
+        parked.set()
+        await asyncio.sleep(3600)
+        return "Yes"
+
+    ex._elicitation_choice_handler = never_answers  # type: ignore[assignment]
+
+    async def drive() -> None:
+        async for _ in ex.run_turn([{"role": "user", "content": "go"}], [], ""):
+            pass
+
+    turn = asyncio.create_task(drive())
+    await asyncio.wait_for(parked.wait(), timeout=15)
+    assert ex._request_tasks, "in-flight handlers should be tracked"
+
+    await ex.close()
+    turn.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await turn
+    assert not ex._request_tasks, "close() must drop in-flight handlers"
 
 
 # ---------------------------------------------------------------------------

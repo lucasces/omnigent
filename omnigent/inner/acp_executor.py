@@ -419,6 +419,10 @@ class AcpExecutor(Executor):
         # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, _AcpJsonObject] = {}
+        # In-flight ``_respond_to_agent_request`` handlers. Held so a handler
+        # awaiting a human decision is not garbage-collected mid-flight, and so
+        # teardown can cancel whatever is still parked on a card.
+        self._request_tasks: set[asyncio.Task[None]] = set()
         # call_id -> machine tool name from ``_meta`` (see _meta_tool_name).
         self._tool_machine_names: dict[str, str] = {}
 
@@ -817,6 +821,40 @@ class AcpExecutor(Executor):
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
     # ------------------------------------------------------------------
+
+    def _dispatch_agent_request(self, request: _AcpJsonObject) -> None:
+        """Handle a server-initiated request WITHOUT blocking the event loop.
+
+        A ``session/request_permission`` can park for as long as a human takes
+        to answer. Awaiting it inline stalled everything behind it on the same
+        stream: kiro-cli fans out its permission requests (three arriving in the
+        same millisecond, and not in the order the model issued them), so the
+        second and third cards were not even created until the first was
+        answered, and the ``session/update`` text/tool events queued behind them
+        went unrendered meanwhile.
+
+        Each handler therefore runs as its own task. That is safe because a
+        reply is addressed by the request's own JSON-RPC ``id`` (see
+        :meth:`_respond_to_agent_request`), so concurrent handlers cannot
+        mis-route each other's answers and the order replies are written in
+        carries no meaning. Writes are serialized by ``_send``'s write lock.
+        """
+        task = asyncio.create_task(self._respond_to_agent_request(request))
+        self._request_tasks.add(task)
+        task.add_done_callback(self._finish_agent_request)
+
+    def _finish_agent_request(self, task: asyncio.Task[None]) -> None:
+        """Drop a finished request handler, surfacing an unexpected failure."""
+        self._request_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "acp[%s] agent-request handler failed: %s",
+                self._config.name,
+                describe_exception(exc),
+            )
 
     async def _respond_to_agent_request(self, request: _AcpJsonObject) -> None:
         """Answer a server-initiated ACP request from the agent.
@@ -1330,6 +1368,10 @@ class AcpExecutor(Executor):
         self._tool_names.clear()
         self._tool_inputs.clear()
         self._tool_machine_names.clear()
+        # Whatever is still parked on a card belongs to the session going away.
+        for task in tuple(self._request_tasks):
+            task.cancel()
+        self._request_tasks.clear()
         self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
@@ -1625,7 +1667,7 @@ class AcpExecutor(Executor):
             except asyncio.QueueEmpty:
                 break
             if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
-                await self._respond_to_agent_request(stale)
+                self._dispatch_agent_request(stale)
 
         self._rpc_id += 1
         req_id = self._rpc_id
@@ -1690,8 +1732,10 @@ class AcpExecutor(Executor):
                     yield event
             elif notification.get("id") is not None and notification.get("method"):
                 # Server-initiated request (session/request_permission / fs/*):
-                # routes through policy + elicitation. Blocks while the human decides.
-                await self._respond_to_agent_request(notification)
+                # routes through policy + elicitation. Dispatched as its own task
+                # so a card awaiting a human does not stall the rest of this
+                # stream -- see _dispatch_agent_request.
+                self._dispatch_agent_request(notification)
 
             # Inbound message = progress; reset the idle deadline.
             deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
