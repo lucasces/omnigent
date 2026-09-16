@@ -279,6 +279,53 @@ def _inline_text_file_data(file_data: object) -> str:
         return ""
 
 
+# Machine tool-name locations inside a frame's ``_meta``, most specific first.
+# A TABLE, not an if-chain: a new agent dialect is one row here rather than a
+# branch in the extraction path (the same shape ``_is_bridge_tool_call`` already
+# relies on for Goose).
+#
+# Why this is needed at all: ACP's ``toolCall.title`` is a *human* label, and
+# some agents decorate it per invocation -- kiro-cli sends
+# ``"Running: echo hello"`` for its ``shell`` tool and
+# ``"Running: @omnigent/sys_session_create"`` for an MCP tool. Feeding that to
+# the TOOL_CALL policy means a rule written for ``shell`` can NEVER match, so a
+# DENY silently fails to fire. The machine name lives in ``_meta`` instead.
+_TOOL_IDENTITY_META_PATHS: tuple[tuple[str, ...], ...] = (
+    # kiro-cli: MCP tool identity carried on ``session/request_permission``.
+    ("mcpToolIdentity", "toolName"),
+    # kiro-cli: vendor block carried on ``tool_call`` session updates.
+    ("kiro", "toolName"),
+    # Goose: machine name beside the humanized title (both known shapes).
+    ("goose", "toolCall", "toolName"),
+    ("goose", "toolName"),
+)
+
+
+def _meta_tool_name(container: object) -> str:
+    """The machine tool name from a frame's ``_meta``, or ``""`` when absent.
+
+    :param container: Any ACP frame fragment that may carry ``_meta`` (a
+        ``session/request_permission`` params dict, its ``toolCall``, or a
+        ``tool_call`` update).
+    :returns: The first non-empty name found via
+        :data:`_TOOL_IDENTITY_META_PATHS`, else ``""``.
+    """
+    if not isinstance(container, dict):
+        return ""
+    meta = container.get("_meta")
+    if not isinstance(meta, dict):
+        return ""
+    for path in _TOOL_IDENTITY_META_PATHS:
+        node: object = meta
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, str) and node.strip():
+            return node.strip()
+    return ""
+
+
 def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     """Split an ``image/*`` ``data:`` URI into ``(mime_type, base64_payload)``.
 
@@ -372,6 +419,8 @@ class AcpExecutor(Executor):
         # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, _AcpJsonObject] = {}
+        # call_id -> machine tool name from ``_meta`` (see _meta_tool_name).
+        self._tool_machine_names: dict[str, str] = {}
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -886,15 +935,26 @@ class AcpExecutor(Executor):
         card cannot say what is about to run and no TOOL_CALL policy rule can
         match it (rules gate on the tool name, then read its arguments).
 
-        (Vendor-specific ``_meta`` tool names — e.g. Goose's
-        ``_meta.goose.toolCall.toolName`` — are not read here; ``title`` is the
-        portable name and ``toolCallId`` the portable correlation.)
+        The machine name in ``_meta`` wins over ``title`` (see
+        :data:`_TOOL_IDENTITY_META_PATHS`): ``title`` is a human label that some
+        agents decorate per invocation, and the TOOL_CALL policy gates on the
+        tool *name*, so a decorated title makes every rule miss.
         """
         tool_call = params.get("toolCall") or {}
         call_id = tool_call.get("toolCallId")
         call_id = call_id if isinstance(call_id, str) else None
+        # Machine name first: ``_meta`` on the request, then on its toolCall,
+        # then the machine name the originating ``tool_call`` update reported for
+        # this id (kiro's permission frame carries ``_meta.trustOptions`` but NOT
+        # the tool name for builtin tools, so that cache is the only source for
+        # e.g. ``shell``). Only then the humanized ``title``/``kind``, and last
+        # the display cache -- an agent that sends no ``_meta`` therefore
+        # resolves exactly as it did before (Devin / Grok / jcode / generic acp).
         name = (
-            tool_call.get("title")
+            _meta_tool_name(params)
+            or _meta_tool_name(tool_call)
+            or (self._tool_machine_names.get(call_id) if call_id else None)
+            or tool_call.get("title")
             or tool_call.get("kind")
             or (self._tool_names.get(call_id) if call_id else None)
             or "tool"
@@ -1269,6 +1329,7 @@ class AcpExecutor(Executor):
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
+        self._tool_machine_names.clear()
         self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
@@ -1324,11 +1385,20 @@ class AcpExecutor(Executor):
         elif update_type == _UPDATE_TOOL_CALL:
             call_id = update.get("toolCallId")
             name = update.get("title") or update.get("kind") or "tool"
+            # The machine name (when the agent sends one) is cached separately
+            # from the humanized title: tool cards keep reading ``name``, while
+            # the TOOL_CALL policy reads the machine name via
+            # ``_extract_tool_call``. kiro's permission frame omits the tool name
+            # for builtin tools, so this cache is the only machine-name source
+            # for e.g. ``shell``.
+            machine_name = _meta_tool_name(update)
             raw_input = update.get("rawInput")
             args = raw_input if isinstance(raw_input, dict) else {}
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
                 self._tool_inputs[call_id] = args
+                if machine_name:
+                    self._tool_machine_names[call_id] = machine_name
                 metadata: _AcpJsonObject = {"call_id": call_id}
                 # An agent-native tool ran inside the agent's own loop and never
                 # round-trips Omnigent dispatch. Leaving its id in the correlation
@@ -1345,6 +1415,7 @@ class AcpExecutor(Executor):
             ):
                 name = self._tool_names.pop(call_id, "tool")
                 self._tool_inputs.pop(call_id, None)
+                self._tool_machine_names.pop(call_id, None)
                 events.append(
                     ToolCallComplete(
                         name=name,

@@ -189,6 +189,108 @@ def test_extract_tool_call_prefers_the_request_over_the_cache() -> None:
     assert (name, args) == ("shell", {"command": "ls"})
 
 
+def test_extract_tool_call_prefers_the_machine_name_over_a_decorated_title() -> None:
+    """kiro sends an MCP tool's machine name in ``_meta.mcpToolIdentity``.
+
+    Its ``title`` is a humanized ``"Running: @server/tool"``. The TOOL_CALL
+    policy gates on the tool *name*, so a rule for ``spike_gated_tool`` must
+    match; captured verbatim from a live kiro-cli 2.20.1 ACP session.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    name, _ = ex._extract_tool_call(
+        {
+            "toolCall": {
+                "toolCallId": "toolu_1",
+                "title": "Running: @spike/spike_gated_tool",
+                "rawInput": {"__tool_use_purpose": "..."},
+            },
+            "_meta": {"mcpToolIdentity": {"serverName": "spike", "toolName": "spike_gated_tool"}},
+        }
+    )
+    assert name == "spike_gated_tool"
+
+
+def test_extract_tool_call_recovers_a_builtin_name_from_the_tool_call_update() -> None:
+    """kiro's permission frame omits the tool name for *builtin* tools.
+
+    It carries only ``_meta.trustOptions``; the machine name (``shell``) arrived
+    earlier on the ``tool_call`` update as ``_meta.kiro.toolName``. Without that
+    carry-over the policy would see ``"Running: echo hi"`` -- a string that
+    varies per invocation, so no static rule could ever match it.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_2",
+            "title": "Running: echo hi",
+            "kind": "execute",
+            "rawInput": {"command": "echo hi"},
+            "_meta": {"kiro": {"toolName": "shell"}},
+        }
+    )
+    name, args = ex._extract_tool_call(
+        {
+            "toolCall": {
+                "toolCallId": "toolu_2",
+                "title": "Running: echo hi",
+                "rawInput": {"command": "echo hi"},
+            },
+            "_meta": {"trustOptions": [{"label": "Base command", "patterns": ["echo( .*)?"]}]},
+        }
+    )
+    assert name == "shell"
+    # Arguments still reach the policy, so argument-inspecting rules keep working.
+    assert args == {"command": "echo hi"}
+
+
+def test_tool_card_keeps_the_humanized_title_while_policy_sees_the_machine_name() -> None:
+    """The machine name is for policy; the card still reads the agent's title."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    events = list(
+        ex._handle_session_update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "c9",
+                "title": "Running: echo hi",
+                "rawInput": {"command": "echo hi"},
+                "_meta": {"kiro": {"toolName": "shell"}},
+            }
+        )
+    )
+    assert [e.name for e in events] == ["Running: echo hi"]
+    assert ex._tool_machine_names["c9"] == "shell"
+
+
+def test_extract_tool_call_without_meta_is_unchanged() -> None:
+    """Agents that send no ``_meta`` (Devin / Grok / jcode / generic) are untouched."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    name, args = ex._extract_tool_call(
+        {"toolCall": {"toolCallId": "t3", "title": "developer__shell", "rawInput": {"c": 1}}}
+    )
+    assert (name, args) == ("developer__shell", {"c": 1})
+
+
+def test_machine_name_cache_is_evicted_when_the_call_completes() -> None:
+    """A finished call must not leak its identity onto a later call id."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "title": "Running: echo hi",
+            "_meta": {"kiro": {"toolName": "shell"}},
+        }
+    )
+    assert "c1" in ex._tool_machine_names
+    list(
+        ex._handle_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"}
+        )
+    )
+    assert "c1" not in ex._tool_machine_names
+
+
 def test_extract_tool_call_unknown_id_degrades_to_tool() -> None:
     """An id we never saw announced still yields the safe generic fallback."""
     ex = AcpExecutor(AcpAgentConfig(command="x"))
