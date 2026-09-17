@@ -596,13 +596,24 @@ class ExecutorAdapter(HarnessApp):
         With *requested_schema* the card renders one button per choice instead of
         Approve/Reject; without it, the usual binary card.
         """
-        # Build a concise preview: truncate long args so the UI widget
-        # stays readable. 300 chars matches AP's policy-engine preview.
-        try:
-            preview = json.dumps(tool_input, ensure_ascii=False)
-        except (TypeError, ValueError):
-            preview = repr(tool_input)
-        preview = preview[:300]
+        # Dunder-prefixed keys are an agent's own bookkeeping (kiro-cli's
+        # shell tool sends ``__tool_use_purpose``) -- strip them so no
+        # implementation detail leaks into the approval card.
+        display_input = {k: v for k, v in tool_input.items() if not k.startswith("__")}
+
+        # A lone string ``command`` argument -- every shell-like tool's
+        # shape -- previews as the bare command instead of
+        # ``tool_name({"command": "..."})``; anything richer falls back to
+        # the JSON dump (300 chars matches AP's policy-engine preview cap).
+        command = display_input.get("command")
+        if list(display_input) == ["command"] and isinstance(command, str):
+            content_preview = f"{tool_name}: {command[:300]}"
+        else:
+            try:
+                preview = json.dumps(display_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                preview = repr(display_input)
+            content_preview = f"{tool_name}({preview[:300]})"
 
         label = self._harness_label
         return ElicitationRequestParams(
@@ -612,7 +623,7 @@ class ExecutorAdapter(HarnessApp):
             url=None,
             phase="tool_call",
             policy_name=f"{label.lower()}_sdk_permission",
-            content_preview=f"{tool_name}({preview})",
+            content_preview=content_preview,
         )
 
     async def _stable_elicitation_choice_handler(

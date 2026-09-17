@@ -2329,9 +2329,50 @@ async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> No
     }
     # The card still names the tool and previews its arguments, as the binary one does.
     assert "Ran command" in params.message
-    assert params.content_preview == 'Ran command({"command": "ls"})'
+    # A single string ``command`` argument previews as the bare command
+    # (no JSON braces/quotes to read past) -- see _permission_card.
+    assert params.content_preview == "Ran command: ls"
     assert params.phase == "tool_call"
     assert not ctx.cancelled.was_set
+
+
+def test_permission_card_strips_dunder_fields_from_the_preview() -> None:
+    """Internal bookkeeping keys never reach the approval card.
+
+    Regression for the kiro-acp launch: kiro-cli's shell tool sends
+    rawInput as {"__tool_use_purpose": "...", "command": "echo -n"}.
+    Before this fix, _permission_card dumped that dict verbatim into
+    content_preview, so the card leaked kiro's private rationale field
+    to the user instead of showing just the command that is about to run.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    params = adapter._permission_card(
+        "shell", {"__tool_use_purpose": "Third no-op command.", "command": "echo -n"}
+    )
+
+    assert params.content_preview == "shell: echo -n"
+    assert "__tool_use_purpose" not in params.content_preview
+    assert params.message == "Claude wants to use **shell**"
+
+
+def test_permission_card_strips_dunder_fields_from_richer_input_too() -> None:
+    """A multi-argument tool call still hides dunder keys, JSON dump or not.
+
+    Only the single-command-argument shape gets the bare-string preview;
+    anything richer falls back to the JSON dump, but that dump must still
+    exclude dunder-prefixed keys.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    params = adapter._permission_card(
+        "write_file", {"__tool_use_purpose": "scratch", "path": "/tmp/a", "content": "hi"}
+    )
+
+    assert "__tool_use_purpose" not in params.content_preview
+    assert params.content_preview == 'write_file({"path": "/tmp/a", "content": "hi"})'
 
 
 @pytest.mark.asyncio
