@@ -1465,3 +1465,100 @@ describe("ApprovalCard — Kiro command reject-with-feedback", () => {
     );
   });
 });
+
+describe("ApprovalCard — kiro-acp multi-choice command approval (regression)", () => {
+  // 2026-09-17 incident: the "show the real command" fix (ce03f4ded)
+  // started populating `kiroCommand` for kiro-acp prompts, which pushed the
+  // card into the `isKiroCommandApproval` branch. That branch used to
+  // always fall back to binary Approve/Reject buttons no matter what, and
+  // `submitBinary("accept")` posts `{action: "accept"}` with no
+  // `content.answer`. The ACP backend's `_stable_elicitation_choice_handler`
+  // needs `answer` to map the verdict to Yes/Always/No and reads a missing
+  // one as a denial -- so every command ran denied regardless of which
+  // button was clicked. A card carrying BOTH `kiroCommand` and a
+  // multi-choice `requestedSchema` must render the command box AND the
+  // schema-driven option buttons, and clicking an option must submit
+  // `content.answer` rather than a bare binary accept.
+  const acpMultiChoiceProps = {
+    message: "kiro-cli wants to run: echo hi",
+    phase: "pre_tool_use",
+    policyName: "kiro_native_permission",
+    contentPreview: "Running: echo hi",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        answer: { type: "string", enum: ["Yes", "Always", "No"] },
+      },
+      required: ["answer"],
+    },
+    kiroCommand: { command: "echo hi" },
+  } as const;
+
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_abc", blocks: [] });
+  });
+
+  it("renders the command box AND Yes/Always/No option buttons, not Approve/Reject", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_acp_mc"
+        status="pending"
+        response={null}
+        {...acpMultiChoiceProps}
+      />,
+    );
+
+    // The real command is still shown...
+    expect(screen.getByText("Kiro wants to run this command.")).toBeDefined();
+    expect(screen.getByText("echo hi")).toBeDefined();
+    // ...but the buttons are the schema-driven options, not binary.
+    expect(screen.getByTestId("approval-card-options")).toBeDefined();
+    expect(screen.getByRole("button", { name: "Yes" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Always" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "No" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: /^approve$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^reject$/i })).toBeNull();
+  });
+
+  it("submits {action: 'accept', content: {answer: 'Yes'}} when Yes is clicked, not a bare binary accept", () => {
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_acp_mc_click"
+        status="pending"
+        response={null}
+        {...acpMultiChoiceProps}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+
+    expect(submitSpy).toHaveBeenCalledWith("elic_acp_mc_click", "accept", { answer: "Yes" });
+    // Regression guard: this is exactly the shape `submitBinary("accept")`
+    // sent during the incident -- the backend reads it as a denial no
+    // matter which button produced it.
+    expect(submitSpy).not.toHaveBeenCalledWith("elic_acp_mc_click", "accept", undefined);
+  });
+
+  it("keeps the plain kiro-native binary Approve/Reject buttons when there is no requestedSchema", () => {
+    // Pure kiro-native command prompts (no ACP schema) must keep working
+    // exactly as before this fix.
+    render(
+      <ApprovalCard
+        elicitationId="elic_kiro_plain_regress"
+        status="pending"
+        response={null}
+        {...acpMultiChoiceProps}
+        requestedSchema={{}}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-card-options")).toBeNull();
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /^reject$/i })).toBeDefined();
+  });
+});

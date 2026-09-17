@@ -502,6 +502,26 @@ export function ApprovalCard({
       </Button>
     </div>
   );
+  // Multi-choice buttons for a `requestedSchema`-driven scope picker (e.g.
+  // kiro-cli's Yes / Always / No). Shared between the plain multi-choice
+  // branch below and the `isKiroCommandApproval` branch: showing the real
+  // command (`kiroCommand`) and using the agent's own scoped options are
+  // orthogonal -- a bare `command` populating `kiroCommand` must never fall
+  // back to `binaryButtons` when the request also carries a multi-choice
+  // `requestedSchema`, because `submitBinary` posts `{action: "accept"}`
+  // with no `content.answer`, and the server-side choice bridge
+  // (`_stable_elicitation_choice_handler`) reads a missing `answer` as no
+  // choice at all and silently denies, regardless of which button was
+  // clicked. See the 2026-09-17 kiro-acp "approved but denied" incident.
+  const multiChoiceButtons = (
+    <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
+      {optionLabels.map((optLabel) => (
+        <Button key={optLabel} size="sm" variant="outline" onClick={() => submitOption(optLabel)}>
+          {optLabel}
+        </Button>
+      ))}
+    </div>
+  );
   const codexCommandButtons = (
     <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
       <Button
@@ -737,7 +757,16 @@ export function ApprovalCard({
           <>
             <span>Kiro wants to run this command.</span>
             <CommandBlock command={kiroCommand.command} />
-            {kiroRejectWithFeedback ? (
+            {isMultiChoice ? (
+              // The command box above shows WHAT will run; a real
+              // `requestedSchema` (kiro-cli's Yes / Always / No) still
+              // decides HOW it's answered, and takes priority over
+              // `kiroRejectWithFeedback` -- `KiroCommandActions` below
+              // submits `{action}` with no `content.answer`, which the
+              // ACP choice bridge always reads as a denial. See
+              // `multiChoiceButtons`'s comment above.
+              multiChoiceButtons
+            ) : kiroRejectWithFeedback ? (
               <KiroCommandActions
                 allowTrustAlways={kiroTrustAlways === true}
                 onApprove={() => submitBinary("accept")}
@@ -773,18 +802,7 @@ export function ApprovalCard({
                 onReject={() => submitBinary("decline")}
               />
             ) : isMultiChoice ? (
-              <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
-                {optionLabels.map((optLabel) => (
-                  <Button
-                    key={optLabel}
-                    size="sm"
-                    variant="outline"
-                    onClick={() => submitOption(optLabel)}
-                  >
-                    {optLabel}
-                  </Button>
-                ))}
-              </div>
+              multiChoiceButtons
             ) : (
               binaryButtons
             )}
