@@ -387,3 +387,85 @@ describe("parseEvent — response.compaction.in_progress", () => {
     expect(ev).toEqual({ type: "compaction_in_progress" });
   });
 });
+describe("parseEvent — response.elicitation_request (command box)", () => {
+  // ApprovalCard blanks its raw text preview for every multi-choice card
+  // (kiro-cli's shell tool always offers Yes/Always/No, so every ACP
+  // harness's permission prompt is multi-choice). `kiroCommand` is the
+  // escape hatch that still shows the real command in that case — it used
+  // to only light up for the exact literal `policy_name ===
+  // "kiro_native_permission"`, which no ACP harness (kiro-acp included)
+  // ever stamps (`_permission_card` stamps `<label>_sdk_permission`
+  // instead), so their shell-approval cards silently fell back to a bare
+  // "X wants to use **shell**" title with no visible command at all.
+
+  const baseParams = {
+    mode: "form",
+    message: "kiro (acp) wants to use **shell**",
+    phase: "tool_call",
+  };
+
+  it("shows the COMMAND box for the kiro-native policy (existing behavior)", () => {
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elicit_1",
+      params: { ...baseParams, policy_name: "kiro_native_permission", command: "echo hi" },
+    });
+    expect(ev).toMatchObject({ type: "elicitation_request", kiroCommand: { command: "echo hi" } });
+  });
+
+  it("shows the COMMAND box for a generic ACP harness's SDK-permission policy", () => {
+    // e.g. kiro-acp: `_permission_card` stamps `f"{label.lower()}_sdk_permission"`,
+    // which for the ACP kiro harness is literally "kiro (acp)_sdk_permission" —
+    // never equal to the kiro-native literal.
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elicit_2",
+      params: { ...baseParams, policy_name: "kiro (acp)_sdk_permission", command: "rm -rf /tmp/x" },
+    });
+    expect(ev).toMatchObject({
+      type: "elicitation_request",
+      kiroCommand: { command: "rm -rf /tmp/x" },
+    });
+  });
+
+  it("shows the COMMAND box for other ACP harnesses too (devin, grok, jcode)", () => {
+    for (const policyName of [
+      "devin_sdk_permission",
+      "grok_sdk_permission",
+      "jcode_sdk_permission",
+    ]) {
+      const ev = parseEvent("response.elicitation_request", {
+        elicitation_id: "elicit_3",
+        params: { ...baseParams, policy_name: policyName, command: "ls -la" },
+      });
+      expect(ev).toMatchObject({ type: "elicitation_request", kiroCommand: { command: "ls -la" } });
+    }
+  });
+
+  it("defers to codexCommand instead, for Codex's own dedicated command-approval flow", () => {
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elicit_4",
+      params: {
+        ...baseParams,
+        phase: "codex_command_approval",
+        policy_name: "codex_native_command_approval",
+        command: "echo codex",
+      },
+    });
+    expect(ev).toMatchObject({
+      type: "elicitation_request",
+      codexCommand: { command: "echo codex" },
+      kiroCommand: null,
+    });
+  });
+
+  it("stays null when the request carries no real command (genuine AskUserQuestion)", () => {
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elicit_5",
+      params: {
+        ...baseParams,
+        policy_name: "claude_native_permission",
+        ask_user_question: { questions: [{ question: "Which one?", options: ["a", "b"] }] },
+      },
+    });
+    expect(ev).toMatchObject({ type: "elicitation_request", kiroCommand: null });
+  });
+});

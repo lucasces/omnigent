@@ -3956,6 +3956,10 @@ class ElicitationRequestParams(BaseModel):
         this elicitation, e.g. ``"conv_child123"``. Present when a
         child/sub-agent prompt is mirrored into an ancestor stream;
         ``None`` means resolve against the current session.
+    :param command: Untruncated real command behind the request (e.g. a
+        shell tool's ``command`` argument), for a scrollable "COMMAND" box
+        that bypasses the ``content_preview`` cap. ``None`` when there is
+        no single extractable command (e.g. a genuine ``AskUserQuestion``).
     """
 
     mode: Literal["form", "url"] = "form"
@@ -3969,6 +3973,7 @@ class ElicitationRequestParams(BaseModel):
     policy_name: str | None = None
     content_preview: str | None = None
     target_session_id: str | None = None
+    command: str | None = None
 
     # MCP's ElicitRequestParams uses ``extra="allow"``; mirror
     # that here so MCP-shaped passthrough (an MCP server's

@@ -2375,6 +2375,73 @@ def test_permission_card_strips_dunder_fields_from_richer_input_too() -> None:
     assert params.content_preview == 'write_file({"path": "/tmp/a", "content": "hi"})'
 
 
+def test_permission_card_carries_the_real_command_for_every_acp_harness() -> None:
+    """A bare ``command`` argument rides the card as ``params.command`` too.
+
+    Regression: web's ApprovalCard blanks its raw preview for every
+    multi-choice card (kiro-cli's shell-permission prompt always offers
+    Yes/Always/No, so ``isMultiChoice`` is always true for it), and the
+    web-side ``kiroCommand`` "COMMAND" box used to only light up for a
+    hardcoded ``policy_name == "kiro_native_permission"`` -- which no ACP
+    harness (kiro-acp included) ever stamps, since ``_permission_card``
+    stamps ``f"{label.lower()}_sdk_permission"`` instead. That silently
+    dropped the real command for every ACP harness's shell-approval card,
+    leaving only the generic "X wants to use **shell**" title. This
+    ``command`` field is what the (now-generalized) web gate keys off of
+    instead -- see ``web/src/lib/sse.ts``'s ``kiroCommand``.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    params = adapter._permission_card("shell", {"command": "rm -rf /tmp/scratch"})
+
+    assert params.command == "rm -rf /tmp/scratch"
+
+
+def test_permission_card_leaves_command_unset_for_richer_input() -> None:
+    """No fabricated command for a tool call that isn't a bare shell command.
+
+    Only the single-``command``-argument shape has one real command to
+    surface; anything richer (or a genuine ``AskUserQuestion``-style
+    payload) must leave ``command`` unset so the web card keeps rendering
+    its normal preview instead of a bogus "COMMAND" box.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    params = adapter._permission_card("write_file", {"path": "/tmp/a", "content": "hi"})
+
+    assert params.command is None
+
+
+@pytest.mark.asyncio
+async def test_elicitation_choice_handler_carries_command_through_multi_choice_bridge() -> None:
+    """The multi-choice bridge kiro-acp actually uses still surfaces ``command``.
+
+    ``_stable_elicitation_choice_handler`` (not the binary
+    ``_stable_elicitation_handler``) is what every ACP harness's shell
+    permission prompt goes through, since kiro-cli always offers a scope
+    picker (Yes/Always/No) rather than a plain accept/reject. Assert the
+    real payload sent to the web card -- not just ``_permission_card`` in
+    isolation -- carries the untruncated command.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="accept", content={"answer": "Allow"}))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    await adapter._stable_elicitation_choice_handler(
+        "shell",
+        {"command": "echo -n"},
+        ["Allow", "Allow this session", "Reject"],
+    )
+
+    (_elicitation_id, params) = ctx.seen[0]
+    assert params.command == "echo -n"
+
+
 @pytest.mark.asyncio
 async def test_elicitation_choice_handler_declines_on_a_dismissed_card() -> None:
     """A declined card returns no choice and signals cancellation, as before."""

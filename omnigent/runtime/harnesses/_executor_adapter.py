@@ -606,7 +606,8 @@ class ExecutorAdapter(HarnessApp):
         # ``tool_name({"command": "..."})``; anything richer falls back to
         # the JSON dump (300 chars matches AP's policy-engine preview cap).
         command = display_input.get("command")
-        if list(display_input) == ["command"] and isinstance(command, str):
+        is_bare_command = list(display_input) == ["command"] and isinstance(command, str)
+        if is_bare_command:
             content_preview = f"{tool_name}: {command[:300]}"
         else:
             try:
@@ -624,6 +625,10 @@ class ExecutorAdapter(HarnessApp):
             phase="tool_call",
             policy_name=f"{label.lower()}_sdk_permission",
             content_preview=content_preview,
+            # Untruncated command, mirroring kiro_native/permissions.py's
+            # "command" extra -- content_preview is blanked for every
+            # multi-choice card, so this is what renders it instead.
+            command=command if is_bare_command else None,
         )
 
     async def _stable_elicitation_choice_handler(
