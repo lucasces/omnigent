@@ -37,6 +37,10 @@ Env vars read at startup:
 - ``HARNESS_ACP_PERMISSION_MODE``: Omnigent permission stance, ``auto`` (default) or
   ``bypassPermissions`` — the latter skips the approval card for a tool call no
   policy had an opinion on, so a headless agent runs without parking on prompts.
+- ``HARNESS_ACP_MCP_PROFILE``: path to an agent-config JSON the Omnigent MCP
+  relay must be written into *before* the agent starts, for agents that read
+  their MCP servers only from the file they are launched against (kiro-cli's
+  ``--agent`` profile). Unset keeps the standard ``session/new`` delivery.
 - ``HARNESS_ACP_INJECT_SYSTEM_PROMPT``: ``"0"`` to skip folding the Omnigent system
   prompt into the first ACP turn. Recommended for Pi-fork agents (e.g. ``omp``) that
   fully own their own system prompt — prepending Omnigent's text can cause the agent's
@@ -72,6 +76,7 @@ _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
 _ENV_PERMISSION_MODE = "HARNESS_ACP_PERMISSION_MODE"
+_ENV_MCP_PROFILE = "HARNESS_ACP_MCP_PROFILE"
 _DEFAULT_PERMISSION_MODE = "auto"
 
 
@@ -146,6 +151,7 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
     inject_system_prompt = _env_enabled(_ENV_INJECT_SYSTEM_PROMPT, default=True)
     cwd = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None
     permission_mode = os.environ.get(_ENV_PERMISSION_MODE, "").strip() or _DEFAULT_PERMISSION_MODE
+    mcp_profile_path = os.environ.get(_ENV_MCP_PROFILE, "").strip() or None
 
     config = AcpAgentConfig(
         command=command,
@@ -157,6 +163,7 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
         env_passthrough=_env_passthrough_names(),
         permission_mode=permission_mode,
         inject_system_prompt=inject_system_prompt,
+        mcp_profile_path=mcp_profile_path,
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env(), extension=extension)
 

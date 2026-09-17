@@ -62,9 +62,11 @@ class AcpCliHarness:
     :param session_agent_profile: Write a per-session kiro-cli agent profile to
         ``<cwd>/.kiro/agents/<name>.json`` and select it with ``--agent <name>``
         (see :func:`omnigent.runtime.workflow._build_acp_cli_spawn_env`). The
-        profile carries the agent's ``instructions`` as its persona plus the
-        pre-authorized ``allowedTools``, which is the only channel kiro-cli
-        reads them from. Off for every other row.
+        profile carries the agent's ``instructions`` as its persona, the
+        pre-authorized ``allowedTools``, and -- written by the executor just
+        before the process starts -- Omnigent's MCP relay, since that profile is
+        the only channel kiro-cli reads any of them from. Off for every other
+        row.
     """
 
     install: HarnessInstallSpec
@@ -137,12 +139,11 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
     # 2.20.1 ACP session:
     #  * ``session_agent_profile`` -- kiro takes its persona, its MCP servers
     #    and its pre-authorized ``allowedTools`` from the ``--agent`` profile.
-    #  * ``omnigent_mcp=False`` -- kiro IGNORES ``session/new.mcpServers``
-    #    entirely (a server declared there never initializes), so advertising
-    #    the relay there would only start a relay nothing connects to. Wiring
-    #    Omnigent's MCP tools into the profile instead is a follow-up; until
-    #    then a ``kiro-acp`` agent has kiro's own tools but not Omnigent's
-    #    builtins (no ``sys_session_*`` orchestration).
+    #  * Omnigent's MCP relay reaches it through that same profile, not through
+    #    ``session/new.mcpServers`` -- kiro ignores the latter outright. The
+    #    executor writes the relay into the profile before the process starts
+    #    (``HARNESS_ACP_MCP_PROFILE``), so ``sys_session_*`` are available from
+    #    the very first message.
     "kiro-acp": AcpCliHarness(
         install=HarnessInstallSpec(
             "Kiro (ACP)",
@@ -152,7 +153,6 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
             auth_hint="sign in with `kiro-cli login` (Omnigent stores no Kiro credential)",
         ),
         args=("acp",),
-        omnigent_mcp=False,
         session_agent_profile=True,
     ),
     # jcode (https://jcode.sh) drives ``jcode acp``. Ships via a curl

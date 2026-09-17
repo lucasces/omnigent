@@ -12,10 +12,12 @@ Two halves:
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import shlex
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -30,6 +32,7 @@ from omnigent.harness_plugins import (
     install_specs,
     valid_harnesses,
 )
+from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.onboarding.harness_install import ui_setup_steps
 from omnigent.runtime.workflow import _build_acp_cli_spawn_env
@@ -330,8 +333,13 @@ def test_kiro_acp_row_writes_a_profile_and_selects_it(tmp_path: Path) -> None:
 
     # The persona is delivered once, by the profile.
     assert env["HARNESS_ACP_INJECT_SYSTEM_PROMPT"] == "0"
-    # kiro ignores session/new.mcpServers, so the relay is not advertised there.
-    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+    # kiro ignores session/new.mcpServers, so the relay is delivered through the
+    # profile instead -- the executor writes it there before spawning.
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "1"
+    assert env["HARNESS_ACP_MCP_PROFILE"] == str(profile)
+    # The shared workspace mcp.json is NOT merged: the relay in this profile is
+    # token-only, and merging would pull in whatever kiro-native left there.
+    assert payload["includeMcpJson"] is False
 
 
 def test_kiro_acp_profile_name_is_stable_per_session(tmp_path: Path) -> None:
@@ -396,3 +404,60 @@ def test_other_rows_get_no_agent_profile(harness: str, tmp_path: Path) -> None:
     )
     assert "--agent" not in env["HARNESS_ACP_COMMAND"]
     assert not (tmp_path / ".kiro").exists()
+
+
+def test_kiro_acp_relay_is_in_the_profile_before_the_agent_starts(tmp_path: Path) -> None:
+    """``sys_session_*`` must work on the FIRST message, not the second.
+
+    kiro-cli reads its MCP servers at startup from the ``--agent`` profile and
+    ignores ``session/new.mcpServers``, so a relay published at session/new (the
+    way every other ACP agent gets it) would never reach it at all. The executor
+    therefore writes the relay into the profile *before* spawning.
+    """
+    profile_dir = tmp_path / ".kiro" / "agents"
+    profile_dir.mkdir(parents=True)
+    profile = profile_dir / "omnigent-test.json"
+    profile.write_text(json.dumps({"name": "omnigent-test", "mcpServers": {}}))
+
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="kiro-cli acp --agent omnigent-test",
+            name="Kiro (ACP)",
+            mcp_profile_path=str(profile),
+        )
+    )
+    tools = [{"name": "sys_session_list"}, {"name": "sys_session_create"}]
+    ex._tool_executor = _noop_tool_executor  # type: ignore[assignment]
+
+    spawned: list[str] = []
+
+    async def _fake_start() -> None:
+        # Whatever the profile says at spawn time is what kiro will ever see.
+        spawned.append(profile.read_text())
+
+    with (
+        patch.object(AcpExecutor, "_start_process", side_effect=_fake_start),
+        patch.object(AcpExecutor, "_ensure_initialized", new=AsyncMock()),
+        patch.object(
+            AcpExecutor, "_ensure_session", new=AsyncMock(side_effect=RuntimeError("stop"))
+        ),
+    ):
+        asyncio.run(_drain(ex.run_turn([{"role": "user", "content": "hi"}], tools, "")))
+
+    assert spawned, "_start_process should have been reached"
+    servers = json.loads(spawned[0])["mcpServers"]
+    assert "omnigent" in servers, servers
+    # The relay is the token-only serve-mcp bridge, not a broader surface.
+    args = servers["omnigent"]["args"]
+    assert "serve-mcp" in args
+    assert "--bridge-dir" in args
+    ex._mcp.close()
+
+
+async def _drain(gen) -> None:
+    async for _ in gen:
+        pass
+
+
+async def _noop_tool_executor(name: str, arguments: dict) -> dict:
+    return {}

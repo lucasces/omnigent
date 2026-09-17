@@ -86,6 +86,100 @@ class OmnigentAcpMcp:
         self._bridge_dir: Path | None = None
         # ``None`` = not yet resolved; a list (possibly empty) = resolved+cached.
         self._acp_servers: list[_JsonObject] | None = None
+        # The relay's native-shape config, shared by both delivery channels.
+        self._native_config: _JsonObject | None = None
+        # Latches once the relay is known to be unavailable (disabled/failed),
+        # so a genuinely-not-ready-yet call is still retried on a later turn.
+        self._unavailable: bool = False
+
+    def _ensure_relay(
+        self,
+        *,
+        tools: list[_JsonObject],
+        tool_executor: ToolExecutor | None,
+        loop: asyncio.AbstractEventLoop,
+        enabled: bool,
+    ) -> _JsonObject | None:
+        """Start the relay once; return its native-shape config, or ``None``.
+
+        Shared by both delivery channels: ``session/new.mcpServers`` (most ACP
+        agents) and the pre-spawn agent profile (kiro-cli, which ignores the
+        former). Either way the relay is the SAME token-only bridge dir, so the
+        agent gets the relay tools and not the raw ``sys_os_*`` filesystem ones.
+
+        ``None`` with :attr:`_unavailable` set means "never going to work";
+        ``None`` without it means "not ready yet" (no tool executor / no tools),
+        which a later turn retries.
+        """
+        if self._native_config is not None:
+            return self._native_config
+        if not enabled or not _mcp_enabled():
+            self._unavailable = True
+            return None
+        if tool_executor is None or not tools:
+            return None  # not ready -- retry on a later turn, don't latch
+        try:
+            from omnigent.harnesses.claude_native.bridge import (
+                build_mcp_config,
+                prepare_acp_mcp_bridge_dir,
+                start_tool_relay,
+            )
+
+            # Secure per-relay bridge dir under the allow-listed ACP-MCP root,
+            # carrying a token-only bridge.json -> serve-mcp serves ONLY the
+            # relay tools (no raw sys_os_* fs tools; the ACP agent owns those).
+            self._bridge_dir = prepare_acp_mcp_bridge_dir()
+            self._relay = start_tool_relay(
+                bridge_dir=self._bridge_dir,
+                tools=list(tools),
+                tool_executor=tool_executor,
+                loop=loop,
+            )
+            self._native_config = build_mcp_config(self._bridge_dir)
+            logger.info(
+                "acp[%s] Omnigent MCP relay ready (%d builtin tools bridged)",
+                self._label,
+                len(tools),
+            )
+            return self._native_config
+        except Exception as exc:  # noqa: BLE001 -- MCP is additive; never break a turn
+            logger.warning(
+                "acp[%s] Omnigent MCP bridge setup failed; agent runs without Omnigent tools: %s",
+                self._label,
+                exc,
+            )
+            self._unavailable = True
+            self._cleanup()
+            return None
+
+    def profile_mcp_servers(
+        self,
+        *,
+        tools: list[_JsonObject],
+        tool_executor: ToolExecutor | None,
+        loop: asyncio.AbstractEventLoop,
+        enabled: bool = True,
+    ) -> _JsonObject:
+        """The relay as a ``{name: {command, args, env}}`` mapping, or ``{}``.
+
+        For agents that read their MCP servers from a config file written before
+        they launch (kiro-cli's ``--agent`` profile) rather than from
+        ``session/new``. Same shape ``build_mcp_config`` already produces, which
+        is exactly what a kiro agent profile's ``mcpServers`` expects.
+        """
+        config = self._ensure_relay(
+            tools=tools, tool_executor=tool_executor, loop=loop, enabled=enabled
+        )
+        if config is None:
+            return {}
+        servers = config.get("mcpServers", {})
+        return servers if isinstance(servers, dict) else {}
+
+    def profile_server_names(self) -> set[str]:
+        """Names of the servers handed to a profile-delivered agent."""
+        config = self._native_config or {}
+        servers = config.get("mcpServers", {})
+        return set(servers) if isinstance(servers, dict) else set()
 
     def session_new_servers(
         self,
@@ -110,44 +204,15 @@ class OmnigentAcpMcp:
         """
         if self._acp_servers is not None:
             return self._acp_servers
-        if not enabled or not _mcp_enabled():
-            self._acp_servers = []
+        config = self._ensure_relay(
+            tools=tools, tool_executor=tool_executor, loop=loop, enabled=enabled
+        )
+        if config is None:
+            if self._unavailable:
+                self._acp_servers = []
             return []
-        if tool_executor is None or not tools:
-            return []  # not ready — retry on a later turn, don't cache
-        try:
-            from omnigent.harnesses.claude_native.bridge import (
-                build_mcp_config,
-                prepare_acp_mcp_bridge_dir,
-                start_tool_relay,
-            )
-
-            # Secure per-relay bridge dir under the allow-listed ACP-MCP root,
-            # carrying a token-only bridge.json → serve-mcp serves ONLY the relay
-            # tools (no raw sys_os_* fs tools; the ACP agent owns those).
-            self._bridge_dir = prepare_acp_mcp_bridge_dir()
-            self._relay = start_tool_relay(
-                bridge_dir=self._bridge_dir,
-                tools=list(tools),
-                tool_executor=tool_executor,
-                loop=loop,
-            )
-            self._acp_servers = _to_acp_mcp_servers(build_mcp_config(self._bridge_dir))
-            logger.info(
-                "acp[%s] Omnigent MCP relay ready (%d builtin tools bridged)",
-                self._label,
-                len(tools),
-            )
-            return self._acp_servers
-        except Exception as exc:  # noqa: BLE001 — MCP is additive; never break a turn
-            logger.warning(
-                "acp[%s] Omnigent MCP bridge setup failed; agent runs without Omnigent tools: %s",
-                self._label,
-                exc,
-            )
-            self._acp_servers = []
-            self._cleanup()
-            return []
+        self._acp_servers = _to_acp_mcp_servers(config)
+        return self._acp_servers
 
     def close(self) -> None:
         """Tear down the relay HTTP server and remove the bridge dir."""

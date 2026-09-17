@@ -327,7 +327,12 @@ def sweep_orphaned_kiro_agent_profiles(workspace: Path) -> int:
 
 
 def write_kiro_agent_profile(
-    workspace: Path, session_id: str, *, prompt: str, description: str = ""
+    workspace: Path,
+    session_id: str,
+    *,
+    prompt: str,
+    description: str = "",
+    include_mcp_json: bool = True,
 ) -> Path:
     """Write the per-session kiro-cli agent profile declaring *prompt*.
 
@@ -353,6 +358,13 @@ def write_kiro_agent_profile(
     :param prompt: The agent's system prompt (``AgentSpec.instructions``).
     :param description: The agent's description (``AgentSpec.description``),
         if any.
+    :param include_mcp_json: Whether kiro should also merge the workspace-wide
+        ``.kiro/settings/mcp.json``. True for the kiro-native TUI, which relies
+        on that shared file. The ``kiro-acp`` path passes ``False``: its
+        Omnigent relay is written straight into this profile with a token-only
+        bridge dir, and merging the shared file would additionally pull in
+        whatever a kiro-native session wrote there -- a broader tool surface
+        than the ACP relay deliberately exposes.
     :returns: The written profile's path. The profile *name* to pass to
         ``--agent`` is ``kiro_agent_profile_name(session_id)``.
     """
@@ -369,7 +381,7 @@ def write_kiro_agent_profile(
         "allowedTools": [f"@{_MCP_SERVER_NAME}/{tool}" for tool in _SUBAGENT_MANAGEMENT_TOOLS],
         "resources": [],
         "toolsSettings": {},
-        "includeMcpJson": True,
+        "includeMcpJson": include_mcp_json,
         "model": None,
         "permissions": {"rules": []},
     }

@@ -201,6 +201,13 @@ class AcpAgentConfig:
         it skips the human approval card for a request no policy had an opinion
         on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
         every mode, so a DENY still blocks and an explicit ASK still prompts.
+    :param mcp_profile_path: Path to an agent-config JSON this executor must
+        write the Omnigent MCP relay into *before* the agent process starts,
+        instead of advertising it in ``session/new``. For agents that read their
+        MCP servers only from the config file they are launched against --
+        kiro-cli, whose ``--agent <name>`` profile is the sole channel (it
+        ignores ``session/new.mcpServers`` outright). ``None`` (default) keeps
+        the standard ``session/new`` delivery every other ACP agent uses.
     :param inject_system_prompt: Fold the Omnigent system prompt into the first
         ACP turn (ACP has no dedicated system-prompt field). On by default. Set
         to ``False`` for agents like Pi forks (``omp``) that fully own their own
@@ -222,6 +229,7 @@ class AcpAgentConfig:
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
     inject_system_prompt: bool = True
+    mcp_profile_path: str | None = None
 
 
 class _AcpRequestError(Exception):
@@ -793,14 +801,22 @@ class AcpExecutor(Executor):
         disabled every call classifies as agent-native.
         """
         mcp_servers: list[_AcpJsonObject] = []
+        servers: set[str] = set()
         if self._config.omnigent_mcp:
-            mcp_servers = self._mcp.session_new_servers(
-                tools=self._omnigent_tools,
-                tool_executor=getattr(self, "_tool_executor", None),
-                loop=asyncio.get_event_loop(),
-                enabled=True,
-            )
-        servers = {str(s.get("name", "")) for s in mcp_servers if isinstance(s, dict)}
+            if self._config.mcp_profile_path:
+                # Already delivered through the agent profile before spawn, so
+                # there is nothing to advertise here -- but the relay's server
+                # name still has to register, or every bridged call would
+                # classify as agent-native and mis-pair the dispatch queue.
+                servers = self._mcp.profile_server_names()
+            else:
+                mcp_servers = self._mcp.session_new_servers(
+                    tools=self._omnigent_tools,
+                    tool_executor=getattr(self, "_tool_executor", None),
+                    loop=asyncio.get_event_loop(),
+                    enabled=True,
+                )
+                servers = {str(s.get("name", "")) for s in mcp_servers if isinstance(s, dict)}
         servers.discard("")
         tools = {
             name
@@ -1571,6 +1587,59 @@ class AcpExecutor(Executor):
             "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
         )
 
+    def _wire_profile_mcp(self) -> None:
+        """Write the Omnigent MCP relay into the agent profile, before spawn.
+
+        kiro-cli reads its MCP servers when it starts, from the ``--agent``
+        profile -- it ignores ``session/new.mcpServers`` entirely. The relay
+        therefore has to exist *before* the process is launched, which is why
+        this runs at the head of a turn rather than at ``session/new`` like
+        every other ACP agent.
+
+        The relay is the same token-only bridge the ``session/new`` channel
+        uses, so a profile-delivered agent gets exactly the relay tools and not
+        the raw ``sys_os_*`` filesystem ones. Best-effort throughout: a failure
+        here leaves the agent running with its own tools, never a broken turn.
+        """
+        profile_path = self._config.mcp_profile_path
+        if not profile_path or not self._config.omnigent_mcp:
+            return
+        servers = self._mcp.profile_mcp_servers(
+            tools=self._omnigent_tools,
+            tool_executor=getattr(self, "_tool_executor", None),
+            loop=asyncio.get_event_loop(),
+            enabled=True,
+        )
+        if not servers:
+            return
+        path = Path(profile_path)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("agent profile is not a JSON object")
+            existing = payload.get("mcpServers")
+            payload["mcpServers"] = {
+                **(existing if isinstance(existing, dict) else {}),
+                **servers,
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+            logger.info(
+                "acp[%s] wrote Omnigent MCP relay into agent profile %s (%s)",
+                self._config.name,
+                path.name,
+                ", ".join(sorted(servers)),
+            )
+        except Exception as exc:  # noqa: BLE001 -- MCP is additive; never break a turn
+            logger.warning(
+                "acp[%s] could not write the MCP relay into %s; the agent runs "
+                "without Omnigent tools: %s",
+                self._config.name,
+                path,
+                exc,
+            )
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1596,6 +1665,10 @@ class AcpExecutor(Executor):
         self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
         try:
             if self._proc is None or self._proc.returncode is not None:
+                # Must precede the spawn: a profile-delivered agent reads its
+                # MCP servers from the profile at startup (see
+                # _wire_profile_mcp), so writing them afterwards is too late.
+                self._wire_profile_mcp()
                 await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()

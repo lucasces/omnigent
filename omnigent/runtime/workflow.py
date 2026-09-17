@@ -1525,7 +1525,7 @@ def _build_goose_spawn_env(
 
 def _write_kiro_session_agent_profile(
     spec: AgentSpec, *, cwd: Path | None, session_id: str | None
-) -> str | None:
+) -> tuple[str, Path] | None:
     """Write this session's kiro-cli agent profile; return its ``--agent`` name.
 
     Reuses the writer the ``kiro-native`` harness already uses -- the profile
@@ -1534,9 +1534,15 @@ def _write_kiro_session_agent_profile(
     ``kiro-cli acp`` session). The name is a digest of the session id, so
     concurrent sessions sharing one workspace never collide on it.
 
-    :returns: The profile name to pass to ``--agent``, or ``None`` when there is
-        nothing to write (no session id, no workspace, or empty instructions --
-        in which case kiro runs under its own default agent).
+    ``includeMcpJson`` is off: the Omnigent relay is written into this profile
+    by the executor (with a token-only bridge dir), and merging the shared
+    workspace ``.kiro/settings/mcp.json`` would additionally pull in whatever a
+    kiro-native session left there -- a broader tool surface than the ACP relay
+    deliberately exposes.
+
+    :returns: ``(profile name for --agent, profile path)``, or ``None`` when
+        there is nothing to write (no session id, no workspace, or empty
+        instructions -- in which case kiro runs under its own default agent).
     """
     if session_id is None or cwd is None:
         return None
@@ -1554,13 +1560,14 @@ def _write_kiro_session_agent_profile(
         session_id,
         prompt=instructions,
         description=(getattr(spec, "description", None) or ""),
+        include_mcp_json=False,
     )
     # Register for teardown on the same hooks kiro-native uses, so the file does
     # not linger in the user's workspace after the session ends.
     from omnigent.runner.native.orchestration import _KIRO_AGENT_PROFILE_FILES
 
     _KIRO_AGENT_PROFILE_FILES[session_id] = path
-    return kiro_agent_profile_name(session_id)
+    return kiro_agent_profile_name(session_id), path
 
 
 def _build_acp_cli_spawn_env(
@@ -1603,13 +1610,13 @@ def _build_acp_cli_spawn_env(
     )
     argv = [executable, *row.args]
     # A row that carries a per-session persona (kiro) selects it with --agent.
-    profile_name = (
+    profile = (
         _write_kiro_session_agent_profile(spec, cwd=cwd, session_id=session_id)
         if row.session_agent_profile
         else None
     )
-    if profile_name is not None:
-        argv += ["--agent", profile_name]
+    if profile is not None:
+        argv += ["--agent", profile[0]]
     env = {
         "HARNESS_ACP_COMMAND": shlex.join(argv),
         "HARNESS_ACP_NAME": row.label,
@@ -1631,10 +1638,14 @@ def _build_acp_cli_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
-    if profile_name is not None:
+    if profile is not None:
         # The persona already reaches the agent through the profile; folding it
         # into the first user turn as well would deliver it twice.
         env["HARNESS_ACP_INJECT_SYSTEM_PROMPT"] = "0"
+        # kiro reads MCP servers from this profile at startup, so the executor
+        # writes the relay into it before spawning rather than advertising it
+        # in session/new (which kiro ignores).
+        env["HARNESS_ACP_MCP_PROFILE"] = str(profile[1])
     return env
 
 
