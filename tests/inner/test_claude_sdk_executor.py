@@ -5649,3 +5649,94 @@ async def test_terminal_error_carries_observed_usage() -> None:
     assert usage["context_tokens"] == 100_000
     # output_tokens is unknown on an incomplete turn — reported as 0.
     assert usage["output_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: TOOL_CALL policy gate — already_confirmed_by_human regression
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_tool_call_policy_confirmed_allow_returns_permission_allow() -> None:
+    """Regression: an ALLOW verdict collapsed from a human-resolved ASK
+    (``already_confirmed_by_human``) must short-circuit to an explicit allow
+    so ``_can_use_tool_gate`` does not run its own elicitation gate a second
+    time for the same decision.
+    """
+    from claude_agent_sdk import PermissionResultAllow
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+
+    class _V:
+        action = "POLICY_ACTION_ALLOW"
+        already_confirmed_by_human = True
+
+    executor._policy_evaluator = AsyncMock(return_value=_V())
+    result = await executor._evaluate_tool_call_policy("mcp__github__issue_write", {})
+    assert isinstance(result, PermissionResultAllow)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_tool_call_policy_plain_allow_falls_through() -> None:
+    """A plain ALLOW with no prior human confirmation is a genuine
+    fallthrough (no policy had an opinion worth skipping the human for) --
+    it must return ``None`` so the caller's elicitation gate still runs.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+
+    class _V:
+        action = "POLICY_ACTION_ALLOW"
+
+    executor._policy_evaluator = AsyncMock(return_value=_V())
+    result = await executor._evaluate_tool_call_policy("mcp__github__issue_write", {})
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_can_use_tool_gate_skips_second_ask_when_already_confirmed() -> None:
+    """The unified ``can_use_tool`` gate must not call the human-consent
+    elicitation handler when the TOOL_CALL policy verdict is an
+    already-human-confirmed ALLOW.
+    """
+    from claude_agent_sdk import PermissionResultAllow
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+
+    class _V:
+        action = "POLICY_ACTION_ALLOW"
+        already_confirmed_by_human = True
+
+    executor._policy_evaluator = AsyncMock(return_value=_V())
+    executor._elicitation_handler = AsyncMock(return_value=True)
+
+    result = await executor._can_use_tool_gate("mcp__github__issue_write", {}, object())
+
+    assert isinstance(result, PermissionResultAllow)
+    executor._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_can_use_tool_gate_still_asks_on_plain_allow() -> None:
+    """A legitimate fallthrough (no policy had an opinion worth skipping the
+    human for) must still run the elicitation gate -- the fix must not make
+    the gate less safe.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+
+    class _V:
+        action = "POLICY_ACTION_ALLOW"
+
+    executor._policy_evaluator = AsyncMock(return_value=_V())
+    executor._elicitation_handler = AsyncMock(return_value=True)
+
+    await executor._can_use_tool_gate("mcp__github__issue_write", {}, object())
+
+    executor._elicitation_handler.assert_awaited_once()

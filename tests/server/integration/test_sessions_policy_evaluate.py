@@ -765,7 +765,12 @@ async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
 
     resp = await evaluate
     assert resp.status_code == 200, resp.text
-    assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    # The runner-side gates (ACP's ``_decide_permission``, claude-sdk's
+    # ``_can_use_tool_gate``) key off this to skip a second, redundant
+    # elicitation for an ASK a human just resolved right here.
+    assert body["already_confirmed_by_human"] is True
 
 
 async def test_tool_call_ask_returns_deny_on_decline(
@@ -799,7 +804,11 @@ async def test_tool_call_ask_returns_deny_on_decline(
 
     resp = await evaluate
     assert resp.status_code == 200, resp.text
-    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    # A decline is not a confirmed-by-human ALLOW; the flag must not
+    # appear here (it only ever marks an accepted ASK).
+    assert "already_confirmed_by_human" not in body
 
 
 async def test_tool_call_ask_forwards_popup_event_to_runner(

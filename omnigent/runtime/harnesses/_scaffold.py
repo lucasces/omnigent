@@ -152,11 +152,19 @@ class PolicyVerdictPayload:
         ``None`` on ALLOW.
     :param data: Optional data dict from content-rewriting
         policies. ``None`` when the policy does not rewrite.
+    :param already_confirmed_by_human: ``True`` when this ALLOW/DENY
+        collapsed from an ASK a human just resolved server-side (see
+        ``_hold_native_ask_gate`` in the server's ``/policies/evaluate``
+        route). A caller's own fallthrough elicitation gate (the ACP
+        ``_decide_permission`` / claude-sdk ``_can_use_tool_gate``
+        permission prompt) must skip re-asking when this is set, since
+        the human already answered the same question moments ago.
     """
 
     action: str
     reason: str | None = None
     data: dict[str, Any] | None = None
+    already_confirmed_by_human: bool = False
 
 
 # ── Inbound event schemas (POST /v1/sessions/{id}/events) ─────────
@@ -352,6 +360,8 @@ class PolicyVerdictEvent(BaseModel):
         e.g. ``"Denied by cost-limit policy"``. ``None`` on ALLOW.
     :param data: Optional data dict from content-rewriting
         policies. ``None`` when the policy does not rewrite.
+    :param already_confirmed_by_human: ``True`` when this verdict
+        collapsed from an ASK a human just resolved server-side.
     """
 
     type: Literal["policy_verdict"]
@@ -359,6 +369,7 @@ class PolicyVerdictEvent(BaseModel):
     action: str
     reason: str | None = None
     data: dict[str, Any] | None = None
+    already_confirmed_by_human: bool = False
 
 
 # Discriminated union of every downward event the harness accepts on
@@ -1248,6 +1259,7 @@ class HarnessApp:
             action=body.action,
             reason=body.reason,
             data=body.data,
+            already_confirmed_by_human=body.already_confirmed_by_human,
         )
         for ctx in self._in_flight.values():
             if ctx._complete_policy_evaluation(body.evaluation_id, verdict):

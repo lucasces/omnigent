@@ -95,6 +95,7 @@ _AcpJsonObject: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 class _PolicyVerdict(Protocol):
     action: str
+    already_confirmed_by_human: bool
 
 
 _PolicyEvaluator: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_PolicyVerdict]]
@@ -1097,7 +1098,10 @@ class AcpExecutor(Executor):
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
            ``POLICY_ACTION_DENY`` denies; ``POLICY_ACTION_ASK`` defers to
            elicitation (and **fails closed** when no handler is wired);
-           ``ALLOW`` / unspecified falls through.
+           ``ALLOW`` / unspecified falls through -- unless the verdict
+           carries ``already_confirmed_by_human`` (an ASK a human just
+           resolved server-side), in which case it allows directly
+           instead of prompting a second time.
         2. **Human-consent elicitation**: the agent's own options via
            :attr:`_elicitation_choice_handler`, else a yes/no card via
            :attr:`_elicitation_handler`. Skipped under
@@ -1122,6 +1126,7 @@ class AcpExecutor(Executor):
 
         if policy_eval is not None:
             action: str | None
+            verdict: _PolicyVerdict | None = None
             try:
                 verdict = await policy_eval(
                     "PHASE_TOOL_CALL", {"name": tool_name, "arguments": tool_input}
@@ -1141,6 +1146,16 @@ class AcpExecutor(Executor):
                     )
                     return False, None
                 return await self._ask_user(tool_name, tool_input, params)
+            if action == "POLICY_ACTION_ALLOW" and getattr(
+                verdict, "already_confirmed_by_human", False
+            ):
+                # The server already collapsed an ASK a human just resolved
+                # into this ALLOW (_hold_native_ask_gate) -- prompting again
+                # here would show a second, redundant approval card.
+                logger.info(
+                    "acp permission allowed (already confirmed by human): tool=%s", tool_name
+                )
+                return True, None
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
         if can_ask and not self._bypass_permissions:

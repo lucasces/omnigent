@@ -630,6 +630,7 @@ async def _evaluate_policy_via_omnigent(
         else None
     )
     verdict_data: _JsonObject | None = None
+    verdict_already_confirmed = False
 
     try:
         ap_resp = await server_client.post(
@@ -662,6 +663,7 @@ async def _evaluate_policy_via_omnigent(
             verdict_action = result.get("result", _default_action)
             verdict_reason = result.get("reason")
             verdict_data = result.get("data")
+            verdict_already_confirmed = bool(result.get("already_confirmed_by_human"))
         else:
             _logger.warning(
                 "AP policy evaluate returned %d for %s; defaulting to %s",
@@ -689,6 +691,8 @@ async def _evaluate_policy_via_omnigent(
         verdict_body["reason"] = verdict_reason
     if verdict_data is not None:
         verdict_body["data"] = verdict_data
+    if verdict_already_confirmed:
+        verdict_body["already_confirmed_by_human"] = True
 
     # Retry once on dead-channel / timeout / non-2xx; any unacknowledged verdict
     # eventually calls on_delivery_failure to cancel the wedged turn.

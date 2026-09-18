@@ -846,6 +846,41 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
 
 
+@pytest.mark.asyncio
+async def test_decide_permission_allow_confirmed_by_human_skips_second_ask() -> None:
+    """Regression: a collapsed ASK->ALLOW a human already resolved server-side
+    (_hold_native_ask_gate) must not trigger a second, redundant elicitation
+    card on the runner side.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    class _V:
+        action = "POLICY_ACTION_ALLOW"
+        already_confirmed_by_human = True
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_allow_without_confirmation_still_asks() -> None:
+    """A plain policy ALLOW with no prior human confirmation is a genuine
+    fallthrough (no policy had an opinion worth skipping the human for) --
+    the elicitation gate must still run.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    class _V:
+        action = "POLICY_ACTION_ALLOW"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_awaited_once()
+
+
 def _seed_tool_call(ex: AcpExecutor) -> dict[str, object]:
     """Announce a ``tool_call``, then return the bare permission params for it.
 

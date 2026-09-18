@@ -2310,12 +2310,15 @@ class ClaudeSDKExecutor(Executor):
             (for example from a read-only evaluation path), this hook runs the
             existing Omnigent elicitation handler before returning
             :class:`claude_agent_sdk.PermissionResultAllow` or DENY; without
-            a handler it fails closed. Returns ``None`` when the call should
-            be allowed to proceed (no policy evaluator wired, an
-            ``mcp__omnigent__*`` tool already gated on the dispatch path, or
-            an ALLOW / no-match verdict). Returning ``None`` lets the caller
-            fall through to its remaining gate logic (elicitation) without
-            forcing an allow.
+            a handler it fails closed. Returns
+            :class:`claude_agent_sdk.PermissionResultAllow` directly (instead
+            of ``None``) when the verdict carries
+            ``already_confirmed_by_human`` -- an ASK a human just resolved
+            server-side -- so the caller's elicitation gate does not prompt a
+            second time for the same decision. Returns ``None`` when the call
+            should be allowed to proceed to that remaining gate logic (no
+            policy evaluator wired, an ``mcp__omnigent__*`` tool already
+            gated on the dispatch path, or a plain ALLOW / no-match verdict).
         """
         _policy_eval = getattr(self, "_policy_evaluator", None)
         if _policy_eval is None:
@@ -2329,6 +2332,19 @@ class ClaudeSDKExecutor(Executor):
             {"name": tool_name, "arguments": tool_input},
         )
         _action = getattr(_verdict, "action", None)
+        if _action == "POLICY_ACTION_ALLOW" and getattr(
+            _verdict, "already_confirmed_by_human", False
+        ):
+            # The server already collapsed an ASK a human just resolved
+            # into this ALLOW (_hold_native_ask_gate) -- allow directly so
+            # the caller's elicitation gate does not prompt a second time.
+            from claude_agent_sdk import PermissionResultAllow
+
+            logger.info(
+                "TOOL_CALL policy already confirmed by human; skipping elicitation tool=%s",
+                tool_name,
+            )
+            return PermissionResultAllow()
         if _action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
             # ALLOW / no-match — fall through (caller decides whether to also
             # run the human-consent elicitation gate).

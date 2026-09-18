@@ -915,8 +915,19 @@ def register_hooks_routes(
                                 content=json.dumps(decline_body),
                                 media_type="application/json",
                             )
+                        # Mark an accepted ALLOW as human-confirmed so the
+                        # runner's own fallthrough elicitation gate (ACP's
+                        # ``_decide_permission`` / claude-sdk's
+                        # ``_can_use_tool_gate``) does not re-ask for a
+                        # decision this ASK already collected. The DENY
+                        # branch here is a timeout/disconnect fail-close
+                        # (an explicit decline raises above), not a human
+                        # decision, so it carries no such signal.
                         approval_body: dict[str, Any] = (
-                            {"result": "POLICY_ACTION_ALLOW"}
+                            {
+                                "result": "POLICY_ACTION_ALLOW",
+                                "already_confirmed_by_human": True,
+                            }
                             if approved
                             else {
                                 "result": "POLICY_ACTION_DENY",

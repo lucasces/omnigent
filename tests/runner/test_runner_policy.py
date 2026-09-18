@@ -113,6 +113,32 @@ async def test_success_deny_verdict_passed_through() -> None:
     assert verdict["reason"] == "blocked"
 
 
+async def test_success_allow_confirmed_by_human_is_forwarded() -> None:
+    """``already_confirmed_by_human`` on the server's ALLOW must reach the
+    harness verdict body -- the runner-side gates (ACP's
+    ``_decide_permission``, claude-sdk's ``_can_use_tool_gate``) key off
+    this to skip a second, redundant elicitation for an ASK a human just
+    resolved server-side.
+    """
+    server = _StatusServerClient(
+        200, {"result": "POLICY_ACTION_ALLOW", "already_confirmed_by_human": True}
+    )
+    verdict = await _run(server, "PHASE_TOOL_CALL")
+    assert verdict["action"] == "POLICY_ACTION_ALLOW", verdict
+    assert verdict["already_confirmed_by_human"] is True
+
+
+async def test_success_allow_without_confirmation_omits_flag() -> None:
+    """A plain ALLOW (no ASK collapse) must not carry the flag -- its
+    absence is what lets the runner's fallthrough elicitation gate still
+    run for a genuine no-opinion ALLOW.
+    """
+    server = _StatusServerClient(200, {"result": "POLICY_ACTION_ALLOW"})
+    verdict = await _run(server, "PHASE_TOOL_CALL")
+    assert verdict["action"] == "POLICY_ACTION_ALLOW", verdict
+    assert "already_confirmed_by_human" not in verdict
+
+
 # ── ExecutorAdapter._stable_policy_evaluator fail-closed ──────────────────
 
 

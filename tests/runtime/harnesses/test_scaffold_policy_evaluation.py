@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from omnigent.runtime.harnesses._scaffold import (
+    HarnessApp,
     PolicyVerdictEvent,
     PolicyVerdictPayload,
     TurnContext,
@@ -179,6 +180,67 @@ async def test_policy_verdict_event_handler(_turn_ctx: TurnContext) -> None:
         "If different, the verdict event was not correctly converted."
     )
     assert result.reason is None
+
+
+@pytest.mark.asyncio()
+async def test_handle_policy_verdict_event_forwards_already_confirmed(
+    _turn_ctx: TurnContext,
+) -> None:
+    """
+    Regression: ``HarnessApp._handle_policy_verdict_event`` (the real
+    handler, not a hand-rolled stand-in) must carry
+    ``already_confirmed_by_human`` from the inbound event into the
+    :class:`PolicyVerdictPayload` it resolves the parked evaluation with.
+    Executors read this field to skip a second, redundant elicitation for
+    an ASK a human just resolved server-side.
+    """
+    app = HarnessApp()
+    ctx = _turn_ctx
+    app._in_flight[ctx.response_id] = ctx
+    eval_id = "poleval_confirmed_001"
+
+    task = asyncio.create_task(ctx.evaluate_policy(eval_id, "PHASE_TOOL_CALL", {}))
+    await asyncio.sleep(0)
+
+    body = PolicyVerdictEvent(
+        type="policy_verdict",
+        evaluation_id=eval_id,
+        action="POLICY_ACTION_ALLOW",
+        already_confirmed_by_human=True,
+    )
+    response = await app._handle_policy_verdict_event(body)
+    assert response.status_code == 204
+
+    result = await asyncio.wait_for(task, timeout=2.0)
+    assert result.action == "POLICY_ACTION_ALLOW"
+    assert result.already_confirmed_by_human is True
+
+
+@pytest.mark.asyncio()
+async def test_handle_policy_verdict_event_defaults_to_not_confirmed(
+    _turn_ctx: TurnContext,
+) -> None:
+    """A verdict event with no ``already_confirmed_by_human`` (the common
+    case -- a plain policy ALLOW/DENY, not a resolved ASK) must resolve to
+    ``False``, so a genuine fallthrough still asks.
+    """
+    app = HarnessApp()
+    ctx = _turn_ctx
+    app._in_flight[ctx.response_id] = ctx
+    eval_id = "poleval_unconfirmed_001"
+
+    task = asyncio.create_task(ctx.evaluate_policy(eval_id, "PHASE_TOOL_CALL", {}))
+    await asyncio.sleep(0)
+
+    body = PolicyVerdictEvent(
+        type="policy_verdict",
+        evaluation_id=eval_id,
+        action="POLICY_ACTION_ALLOW",
+    )
+    await app._handle_policy_verdict_event(body)
+
+    result = await asyncio.wait_for(task, timeout=2.0)
+    assert result.already_confirmed_by_human is False
 
 
 @pytest.mark.asyncio()
